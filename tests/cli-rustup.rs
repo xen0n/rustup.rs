@@ -5,6 +5,10 @@ extern crate rustup_utils;
 extern crate rustup_mock;
 extern crate tempdir;
 
+use std::fs;
+use std::env::consts::EXE_SUFFIX;
+use std::process;
+use rustup_utils::raw;
 use rustup_mock::clitools::{self, Config, Scenario,
                                expect_ok, expect_ok_ex,
                                expect_stdout_ok,
@@ -260,6 +264,49 @@ fn link() {
         expect_ok(config, &["rustup", "default", "custom"]);
         expect_stdout_ok(config, &["rustc", "--version"],
                          "hash-c-1");
+        expect_stdout_ok(config, &["rustup", "show"],
+                         "custom (default)");
+        expect_ok(config, &["rustup", "update", "nightly"]);
+        expect_ok(config, &["rustup", "default", "nightly"]);
+        expect_stdout_ok(config, &["rustup", "show"],
+                         "custom");
+    });
+}
+
+// Issue #809. When we call the fallback cargo, when it in turn invokes
+// "rustc", that rustc should actually be the rustup proxy, not the toolchain rustc.
+// That way the proxy can pick the correct toolchain.
+#[test]
+fn fallback_cargo_calls_correct_rustc() {
+    setup(&|config| {
+        // Hm, this is the _only_ test that assumes that toolchain proxies
+        // exist in CARGO_HOME. Adding that proxy here.
+        let ref rustup_path = config.exedir.join(format!("rustup{}", EXE_SUFFIX));
+        let ref cargo_bin_path = config.cargodir.join("bin");
+        fs::create_dir_all(cargo_bin_path).unwrap();
+        let ref rustc_path = cargo_bin_path.join(format!("rustc{}", EXE_SUFFIX));
+        fs::hard_link(rustup_path, rustc_path).unwrap();
+
+        // Install a custom toolchain and a nightly toolchain for the cargo fallback
+        let path = config.customdir.join("custom-1");
+        let path = path.to_string_lossy();
+        expect_ok(config, &["rustup", "toolchain", "link", "custom",
+                            &path]);
+        expect_ok(config, &["rustup", "default", "custom"]);
+        expect_ok(config, &["rustup", "update", "nightly"]);
+        expect_stdout_ok(config, &["rustc", "--version"],
+                         "hash-c-1");
+        expect_stdout_ok(config, &["cargo", "--version"],
+                         "hash-n-2");
+
+        assert!(rustc_path.exists());
+
+        // Here --call-rustc tells the mock cargo bin to exec `rustc --version`.
+        // We should be ultimately calling the custom rustc, according to the
+        // RUSTUP_TOOLCHAIN variable set by the original "cargo" proxy, and
+        // interpreted by the nested "rustc" proxy.
+        expect_stdout_ok(config, &["cargo", "--call-rustc"],
+                         "hash-c-1");
     });
 }
 
@@ -267,8 +314,10 @@ fn link() {
 fn show_toolchain_none() {
     setup(&|config| {
         expect_ok_ex(config, &["rustup", "show"],
-r"no active toolchain
-",
+for_host!(r"Default host: {0}
+
+no active toolchain
+"),
 r"");
     });
 }
@@ -278,8 +327,101 @@ fn show_toolchain_default() {
     setup(&|config| {
         expect_ok(config, &["rustup", "default", "nightly"]);
         expect_ok_ex(config, &["rustup", "show"],
-for_host!(r"nightly-{0} (default toolchain)
+for_host!(r"Default host: {0}
+
+nightly-{0} (default)
+1.3.0 (hash-n-2)
 "),
+r"");
+    });
+}
+
+#[test]
+fn show_multiple_toolchains() {
+    setup(&|config| {
+        expect_ok(config, &["rustup", "default", "nightly"]);
+        expect_ok(config, &["rustup", "update", "stable"]);
+        expect_ok_ex(config, &["rustup", "show"],
+for_host!(r"Default host: {0}
+
+installed toolchains
+--------------------
+
+stable-{0}
+nightly-{0} (default)
+
+active toolchain
+----------------
+
+nightly-{0} (default)
+1.3.0 (hash-n-2)
+
+"),
+r"");
+    });
+}
+
+#[test]
+fn show_multiple_targets() {
+    // Using the MULTI_ARCH1 target doesn't work on i686 linux
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86") { return }
+
+    clitools::setup(Scenario::MultiHost, &|config| {
+        expect_ok(config, &["rustup", "default",
+                            &format!("nightly-{}", clitools::MULTI_ARCH1)]);
+        expect_ok(config, &["rustup", "target", "add", clitools::CROSS_ARCH2]);
+        expect_ok_ex(config, &["rustup", "show"],
+&format!(r"Default host: {2}
+
+installed targets for active toolchain
+--------------------------------------
+
+{1}
+{0}
+
+active toolchain
+----------------
+
+nightly-{0} (default)
+1.3.0 (xxxx-n-2)
+
+", clitools::MULTI_ARCH1, clitools::CROSS_ARCH2, this_host_triple()),
+r"");
+    });
+}
+
+#[test]
+fn show_multiple_toolchains_and_targets() {
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86") { return }
+
+    clitools::setup(Scenario::MultiHost, &|config| {
+        expect_ok(config, &["rustup", "default",
+                            &format!("nightly-{}", clitools::MULTI_ARCH1)]);
+        expect_ok(config, &["rustup", "target", "add", clitools::CROSS_ARCH2]);
+        expect_ok(config, &["rustup", "update",
+                            &format!("stable-{}", clitools::MULTI_ARCH1)]);
+        expect_ok_ex(config, &["rustup", "show"],
+&format!(r"Default host: {2}
+
+installed toolchains
+--------------------
+
+stable-{0}
+nightly-{0} (default)
+
+installed targets for active toolchain
+--------------------------------------
+
+{1}
+{0}
+
+active toolchain
+----------------
+
+nightly-{0} (default)
+1.3.0 (xxxx-n-2)
+
+", clitools::MULTI_ARCH1, clitools::CROSS_ARCH2, this_host_triple()),
 r"");
     });
 }
@@ -296,14 +438,19 @@ r"");
 }
 
 #[test]
-#[ignore(windows)] // FIXME rustup displays UNC paths
 fn show_toolchain_override() {
+    // FIXME rustup displays UNC paths
+    if cfg!(windows) { return }
+
     setup(&|config| {
         let cwd = ::std::env::current_dir().unwrap();
         expect_ok(config, &["rustup", "override", "add", "nightly"]);
         expect_ok_ex(config, &["rustup", "show"],
-&format!(r"nightly (directory override for '{}')
-", cwd.display()),
+&format!(r"Default host: {0}
+
+nightly-{0} (directory override for '{1}')
+1.3.0 (hash-n-2)
+", this_host_triple(), cwd.display()),
 r"");
     });
 }
@@ -330,7 +477,11 @@ fn show_toolchain_env() {
         let out = cmd.output().unwrap();
         assert!(out.status.success());
         let stdout = String::from_utf8(out.stdout).unwrap();
-        assert!(&stdout == for_host!("nightly-{0} (environment override by RUSTUP_TOOLCHAIN)\n"));
+        assert!(&stdout == for_host!(r"Default host: {0}
+
+nightly-{0} (environment override by RUSTUP_TOOLCHAIN)
+1.3.0 (hash-n-2)
+"));
     });
 }
 
@@ -346,5 +497,246 @@ fn show_toolchain_env_not_installed() {
         assert!(!out.status.success());
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert!(stderr.starts_with("error: toolchain 'nightly' is not installed\n"));
+    });
+}
+
+// #422
+#[test]
+fn update_doesnt_update_non_tracking_channels() {
+    setup(&|config| {
+        expect_ok(config, &["rustup", "default", "nightly"]);
+        expect_ok(config, &["rustup", "update", "nightly-2015-01-01"]);
+        let mut cmd = clitools::cmd(config, "rustup", &["update"]);
+        clitools::env(config, &mut cmd);
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!stderr.contains(
+            for_host!("syncing channel updates for 'nightly-2015-01-01-{}'")));
+    });
+}
+
+#[test]
+fn toolchain_install_is_like_update() {
+    setup(&|config| {
+        expect_ok(config, &["rustup", "toolchain", "install" , "nightly"]);
+        expect_stdout_ok(config, &["rustup", "run", "nightly", "rustc", "--version"],
+                         "hash-n-2");
+    });
+}
+
+#[test]
+fn toolchain_install_is_like_update_except_that_bare_install_is_an_error() {
+    setup(&|config| {
+        expect_err(config, &["rustup", "toolchain", "install"],
+                   "arguments were not provided");
+    });
+}
+
+#[test]
+fn toolchain_update_is_like_update() {
+    setup(&|config| {
+        expect_ok(config, &["rustup", "toolchain", "update" , "nightly"]);
+        expect_stdout_ok(config, &["rustup", "run", "nightly", "rustc", "--version"],
+                         "hash-n-2");
+    });
+}
+
+#[test]
+fn toolchain_update_is_like_update_except_that_bare_install_is_an_error() {
+    setup(&|config| {
+        expect_err(config, &["rustup", "toolchain", "update"],
+                   "arguments were not provided");
+    });
+}
+
+#[test]
+fn proxy_toolchain_shorthand() {
+    setup(&|config| {
+        expect_ok(config, &["rustup", "default", "stable"]);
+        expect_ok(config, &["rustup", "toolchain", "update" , "nightly"]);
+        expect_stdout_ok(config, &["rustc", "--version"], "hash-s-2");
+        expect_stdout_ok(config, &["rustc", "+stable", "--version"], "hash-s-2");
+        expect_stdout_ok(config, &["rustc", "+nightly", "--version"], "hash-n-2");
+    });
+}
+
+#[test]
+fn add_component() {
+    setup(&|config| {
+        expect_ok(config, &["rustup", "default", "stable"]);
+        expect_ok(config, &["rustup", "component", "add", "rust-src"]);
+        let path = format!("toolchains/stable-{}/lib/rustlib/src/rust-src/foo.rs",
+                           this_host_triple());
+        let path = config.rustupdir.join(path);
+        assert!(path.exists());
+    });
+}
+
+#[test]
+fn remove_component() {
+    setup(&|config| {
+        expect_ok(config, &["rustup", "default", "stable"]);
+        expect_ok(config, &["rustup", "component", "add", "rust-src"]);
+        let path = format!("toolchains/stable-{}/lib/rustlib/src/rust-src/foo.rs",
+                           this_host_triple());
+        let path = config.rustupdir.join(path);
+        assert!(path.exists());
+        expect_ok(config, &["rustup", "component", "remove", "rust-src"]);
+        assert!(!path.parent().unwrap().exists());
+    });
+}
+
+// Run without setting RUSTUP_HOME, with setting HOME and USERPROFILE
+fn run_no_home(config: &Config, args: &[&str], env: &[(&str, &str)]) -> process::Output {
+    let home_dir_str = &format!("{}", config.homedir.display());
+    let mut cmd = clitools::cmd(config, args[0], &args[1..]);
+    clitools::env(config, &mut cmd);
+    cmd.env_remove("RUSTUP_HOME");
+    cmd.env("HOME", home_dir_str);
+    cmd.env("USERPROFILE", home_dir_str);
+    for &(name, val) in env {
+        cmd.env(name, val);
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success());
+
+    out
+}
+
+// Rename ~/.multirust to ~/.rustup
+#[test]
+fn multirust_dir_upgrade_rename_multirust_dir_to_rustup() {
+    setup(&|config| {
+        let multirust_dir = config.homedir.join(".multirust");
+        let rustup_dir = config.homedir.join(".rustup");
+        let multirust_dir_str = &format!("{}", multirust_dir.display());
+
+        // First write data into ~/.multirust
+        run_no_home(config, &["rustup", "default", "stable"],
+                    &[("RUSTUP_HOME", multirust_dir_str)]);
+        let out = run_no_home(config, &["rustup", "toolchain", "list"],
+                              &[("RUSTUP_HOME", multirust_dir_str)]);
+        assert!(String::from_utf8(out.stdout).unwrap().contains("stable"));
+
+        assert!(multirust_dir.exists());
+        assert!(!rustup_dir.exists());
+
+        // Next run without RUSTUP_DIR, but with HOME/USERPROFILE set so rustup
+        // can infer RUSTUP_DIR. It will silently move ~/.multirust to
+        // ~/.rustup.
+        let out = run_no_home(config, &["rustup", "toolchain", "list"], &[]);
+        assert!(String::from_utf8(out.stdout).unwrap().contains("stable"));
+
+        assert!(multirust_dir.exists());
+        assert!(fs::symlink_metadata(&multirust_dir).unwrap().file_type().is_symlink());
+        assert!(rustup_dir.exists());
+    });
+}
+
+// Renaming ~/.multirust to ~/.rustup but ~/.rustup/rustup-version (rustup.sh) exists
+#[test]
+fn multirust_dir_upgrade_old_rustup_exists() {
+    setup(&|config| {
+        let multirust_dir = config.homedir.join(".multirust");
+        let rustup_dir = config.homedir.join(".rustup");
+        let rustup_sh_dir = config.homedir.join(".rustup.sh");
+
+        let multirust_dir_str = &format!("{}", multirust_dir.display());
+        let old_rustup_sh_version_file = rustup_dir.join("rustup-version");
+        let new_rustup_sh_version_file = rustup_sh_dir.join("rustup-version");
+
+        // First write data into ~/.multirust
+        run_no_home(config, &["rustup", "default", "stable"],
+                    &[("RUSTUP_HOME", multirust_dir_str)]);
+        let out = run_no_home(config, &["rustup", "toolchain", "list"],
+                              &[("RUSTUP_HOME", multirust_dir_str)]);
+        assert!(String::from_utf8(out.stdout).unwrap().contains("stable"));
+
+        assert!(multirust_dir.exists());
+        assert!(!rustup_dir.exists());
+
+        // Now add rustup.sh data to ~/.rustup
+        fs::create_dir_all(&rustup_dir).unwrap();
+        raw::write_file(&old_rustup_sh_version_file, "1").unwrap();
+        assert!(old_rustup_sh_version_file.exists());
+
+        // Now do the upgrade, and ~/.rustup will be moved to ~/.rustup.sh
+        let out = run_no_home(config, &["rustup", "toolchain", "list"], &[]);
+        assert!(String::from_utf8(out.stdout).unwrap().contains("stable"));
+
+        assert!(multirust_dir.exists());
+        assert!(fs::symlink_metadata(&multirust_dir).unwrap().file_type().is_symlink());
+        assert!(rustup_dir.exists());
+        assert!(!old_rustup_sh_version_file.exists());
+        assert!(new_rustup_sh_version_file.exists());
+    });
+}
+
+// Renaming ~/.multirust to ~/.rustup but ~/.rustup/rustup-version (rustup.sh) exists,
+// oh and alse ~/.rustup.sh exists
+#[test]
+fn multirust_dir_upgrade_old_rustup_existsand_new_rustup_sh_exists() {
+    setup(&|config| {
+        let multirust_dir = config.homedir.join(".multirust");
+        let rustup_dir = config.homedir.join(".rustup");
+        let rustup_sh_dir = config.homedir.join(".rustup.sh");
+
+        let multirust_dir_str = &format!("{}", multirust_dir.display());
+        let old_rustup_sh_version_file = rustup_dir.join("rustup-version");
+        let new_rustup_sh_version_file = rustup_sh_dir.join("rustup-version");
+
+        // First write data into ~/.multirust
+        run_no_home(config, &["rustup", "default", "stable"],
+                    &[("RUSTUP_HOME", multirust_dir_str)]);
+        let out = run_no_home(config, &["rustup", "toolchain", "list"],
+                              &[("RUSTUP_HOME", multirust_dir_str)]);
+        assert!(String::from_utf8(out.stdout).unwrap().contains("stable"));
+
+        assert!(multirust_dir.exists());
+        assert!(!rustup_dir.exists());
+
+        // This time there are two things that look like rustup.sh.
+        // Only one can win. It doesn't matter much which.
+
+        // Now add rustup.sh data to ~/.rustup
+        fs::create_dir_all(&rustup_dir).unwrap();
+        raw::write_file(&old_rustup_sh_version_file, "1").unwrap();
+
+        // Also to ~/.rustup.sh
+        fs::create_dir_all(&rustup_sh_dir).unwrap();
+        raw::write_file(&new_rustup_sh_version_file, "1").unwrap();
+
+        assert!(old_rustup_sh_version_file.exists());
+        assert!(new_rustup_sh_version_file.exists());
+
+        // Now do the upgrade, and ~/.rustup will be moved to ~/.rustup.sh
+        let out = run_no_home(config, &["rustup", "toolchain", "list"], &[]);
+        assert!(String::from_utf8(out.stdout).unwrap().contains("stable"));
+
+        // .multirust is now a symlink to .rustup
+        assert!(multirust_dir.exists());
+        assert!(fs::symlink_metadata(&multirust_dir).unwrap().file_type().is_symlink());
+
+        assert!(rustup_dir.exists());
+        assert!(!old_rustup_sh_version_file.exists());
+        assert!(new_rustup_sh_version_file.exists());
+    });
+}
+
+#[test]
+fn multirust_upgrade_works_with_proxy() {
+    setup(&|config| {
+        let multirust_dir = config.homedir.join(".multirust");
+        let rustup_dir = config.homedir.join(".rustup");
+
+        // Put data in ~/.multirust
+        run_no_home(config, &["rustup", "default", "stable"],
+                    &[("RUSTUP_HOME", &format!("{}", multirust_dir.display()))]);
+
+        run_no_home(config, &["rustc", "--version"], &[]);
+
+        assert!(multirust_dir.exists());
+        assert!(fs::symlink_metadata(&multirust_dir).unwrap().file_type().is_symlink());
+        assert!(rustup_dir.exists());
     });
 }

@@ -1,17 +1,15 @@
-#![feature(core_intrinsics)] // For type_name().
-#![feature(fundamental)]
 #![recursion_limit = "1024"] // for error_chain!
 
-extern crate hyper;
 extern crate rand;
 extern crate scopeguard;
 #[macro_use]
 extern crate error_chain;
-extern crate native_tls;
 extern crate rustc_serialize;
 extern crate sha2;
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-extern crate openssl_sys;
+extern crate url;
+extern crate toml;
+extern crate download;
+extern crate semver;
 
 #[cfg(windows)]
 extern crate winapi;
@@ -31,12 +29,13 @@ extern crate userenv;
 #[cfg(unix)]
 extern crate libc;
 
-pub mod notify;
 pub mod errors;
 pub mod notifications;
 pub mod raw;
 pub mod tty;
 pub mod utils;
+pub mod toml_utils;
 
 pub use errors::*;
-pub use notifications::{Notification, NotifyHandler};
+pub use notifications::{Notification};
+pub mod notify;

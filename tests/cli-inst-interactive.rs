@@ -63,7 +63,7 @@ fn update() {
     setup(&|config| {
         run_input(config, &["rustup-init"], "\n\n");
         let out = run_input(config, &["rustup-init"], "\n\n");
-        assert!(out.ok);
+        assert!(out.ok, "stdout:\n{}\nstderr:\n{}", out.stdout, out.stderr);
     });
 }
 
@@ -80,10 +80,11 @@ fn blank_lines_around_stderr_log_output_install() {
         // output on stderr, then an explicit blank line on stdout
         // before printing $toolchain installed
         assert!(out.stdout.contains(r"
-Press the Enter key to install Rust.
+3) Cancel installation
 
 
   stable installed - 1.1.0 (hash-s-2)
+
 
 Rust is installed now. Great!
 "));
@@ -97,7 +98,8 @@ fn blank_lines_around_stderr_log_output_update() {
         let out = run_input(config, &["rustup-init"], "\n\n");
 
         assert!(out.stdout.contains(r"
-Press the Enter key to install Rust.
+3) Cancel installation
+
 
 
 Rust is installed now. Great!
@@ -138,10 +140,22 @@ fn with_non_default_toolchain() {
 }
 
 #[test]
+fn with_non_release_channel_non_default_toolchain() {
+    setup(&|config| {
+        let out = run_input(config, &["rustup-init", "--default-toolchain=nightly-2015-01-02"],
+                            "\n\n");
+        assert!(out.ok);
+
+        expect_stdout_ok(config, &["rustup", "show"], "nightly");
+        expect_stdout_ok(config, &["rustup", "show"], "2015-01-02");
+    });
+}
+
+#[test]
 fn set_nightly_toolchain() {
     setup(&|config| {
         let out = run_input(config, &["rustup-init"],
-                            "a\nnightly\n\n\n\n");
+                            "2\n\nnightly\n\n\n\n");
         assert!(out.ok);
 
         expect_stdout_ok(config, &["rustup", "show"], "nightly");
@@ -152,7 +166,7 @@ fn set_nightly_toolchain() {
 fn set_no_modify_path() {
     setup(&|config| {
         let out = run_input(config, &["rustup-init"],
-                            "a\n\nno\n\n\n");
+                            "2\n\n\nno\n\n\n");
         assert!(out.ok);
 
         if cfg!(unix) {
@@ -165,7 +179,7 @@ fn set_no_modify_path() {
 fn set_nightly_toolchain_and_unset() {
     setup(&|config| {
         let out = run_input(config, &["rustup-init"],
-                            "a\nnightly\n\na\nbeta\n\n\n\n");
+                            "2\n\nnightly\n\n2\n\nbeta\n\n\n\n");
         assert!(out.ok);
 
         expect_stdout_ok(config, &["rustup", "show"], "beta");
@@ -176,7 +190,7 @@ fn set_nightly_toolchain_and_unset() {
 fn user_says_nope_after_advanced_install() {
     setup(&|config| {
         let out = run_input(config, &["rustup-init"],
-                            "a\n\n\nn\n\n");
+                            "2\n\n\n\nn\n\n");
         assert!(out.ok);
         assert!(!config.cargodir.join("bin").exists());
     });

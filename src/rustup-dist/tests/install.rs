@@ -6,10 +6,11 @@ extern crate tempdir;
 use rustup_dist::component::Components;
 use rustup_dist::component::{DirectoryPackage, Package};
 use rustup_dist::component::Transaction;
+use rustup_dist::dist::DEFAULT_DIST_SERVER;
 use rustup_dist::temp;
 use rustup_dist::ErrorKind;
+use rustup_dist::Notification;
 use rustup_utils::utils;
-use rustup_dist::NotifyHandler;
 use rustup_dist::prefix::InstallPrefix;
 use std::fs::File;
 use std::io::Write;
@@ -108,11 +109,10 @@ fn basic_install() {
     let instdir = TempDir::new("multirust").unwrap();
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
-    let notify = temp::SharedNotifyHandler::none();
     let tmpdir = TempDir::new("multirust").unwrap();
-    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), notify);
-    let notify = NotifyHandler::none();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, notify);
+    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), DEFAULT_DIST_SERVER, Box::new(|_| ()));
+    let notify = |_: Notification| ();
+    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
 
     let components = Components::open(prefix.clone()).unwrap();
 
@@ -147,11 +147,10 @@ fn multiple_component_install() {
     let instdir = TempDir::new("multirust").unwrap();
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
-    let notify = temp::SharedNotifyHandler::none();
     let tmpdir = TempDir::new("multirust").unwrap();
-    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), notify);
-    let notify = NotifyHandler::none();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, notify);
+    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), DEFAULT_DIST_SERVER, Box::new(|_| ()));
+    let notify = |_: Notification| ();
+    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
 
     let components = Components::open(prefix.clone()).unwrap();
 
@@ -191,11 +190,10 @@ fn uninstall() {
     let instdir = TempDir::new("multirust").unwrap();
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
-    let notify = temp::SharedNotifyHandler::none();
     let tmpdir = TempDir::new("multirust").unwrap();
-    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), notify);
-    let notify = NotifyHandler::none();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, notify);
+    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), DEFAULT_DIST_SERVER, Box::new(|_| ()));
+    let notify = |_: Notification| ();
+    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
 
     let components = Components::open(prefix.clone()).unwrap();
 
@@ -206,8 +204,8 @@ fn uninstall() {
     tx.commit();
 
     // Now uninstall
-    let notify = NotifyHandler::none();
-    let mut tx = Transaction::new(prefix.clone(), &tmpcfg, notify);
+    let notify = |_: Notification| ();
+    let mut tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
     for component in components.list().unwrap() {
         tx = component.uninstall(tx).unwrap();
     }
@@ -244,11 +242,10 @@ fn component_bad_version() {
     let instdir = TempDir::new("multirust").unwrap();
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
-    let notify = temp::SharedNotifyHandler::none();
     let tmpdir = TempDir::new("multirust").unwrap();
-    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), notify);
-    let notify = NotifyHandler::none();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, notify);
+    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), DEFAULT_DIST_SERVER, Box::new(|_| ()));
+    let notify = |_: Notification| ();
+    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
 
     let components = Components::open(prefix.clone()).unwrap();
 
@@ -291,11 +288,10 @@ fn unix_permissions() {
     let instdir = TempDir::new("multirust").unwrap();
     let prefix = InstallPrefix::from(instdir.path().to_owned());
 
-    let notify = temp::SharedNotifyHandler::none();
     let tmpdir = TempDir::new("multirust").unwrap();
-    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), notify);
-    let notify = NotifyHandler::none();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, notify);
+    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), DEFAULT_DIST_SERVER, Box::new(|_| ()));
+    let notify = |_: Notification| ();
+    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
 
     let components = Components::open(prefix.clone()).unwrap();
 
@@ -336,11 +332,10 @@ fn install_to_prefix_that_does_not_exist() {
     let does_not_exist = instdir.path().join("super_not_real");
     let prefix = InstallPrefix::from(does_not_exist.clone());
 
-    let notify = temp::SharedNotifyHandler::none();
     let tmpdir = TempDir::new("multirust").unwrap();
-    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), notify);
-    let notify = NotifyHandler::none();
-    let tx = Transaction::new(prefix.clone(), &tmpcfg, notify);
+    let tmpcfg = temp::Cfg::new(tmpdir.path().to_owned(), DEFAULT_DIST_SERVER, Box::new(|_| ()));
+    let notify = |_: Notification| ();
+    let tx = Transaction::new(prefix.clone(), &tmpcfg, &notify);
 
     let components = Components::open(prefix.clone()).unwrap();
 

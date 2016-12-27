@@ -6,10 +6,11 @@ use errors::*;
 use rustup_utils::utils;
 use rustup_utils::notify::NotificationLevel;
 use self_update;
-use std::io::{Write, Read, BufRead};
+use std::io::{Write, BufRead};
 use std::process::Command;
+use std::path::Path;
 use std::{cmp, iter};
-use std::str::FromStr;
+use std::sync::Arc;
 use std;
 use term2;
 
@@ -34,15 +35,18 @@ pub enum Confirm {
     Yes, No, Advanced
 }
 
-pub fn confirm_advanced(default: Confirm) -> Result<Confirm> {
+pub fn confirm_advanced() -> Result<Confirm> {
+    println!("");
+    println!("1) Proceed with installation (default)");
+    println!("2) Customize installation");
+    println!("3) Cancel installation");
+
     let _ = std::io::stdout().flush();
     let input = try!(read_line());
 
     let r = match &*input {
-        "y" | "Y" | "yes" => Confirm::Yes,
-        "n" | "N" | "no" => Confirm::No,
-        "a" | "A" | "advanced" => Confirm::Advanced,
-        "" => default,
+        "1"|"" => Confirm::Yes,
+        "2" => Confirm::Advanced,
         _ => Confirm::No,
     };
 
@@ -99,7 +103,7 @@ pub fn set_globals(verbose: bool) -> Result<Cfg> {
 
     let download_tracker = RefCell::new(DownloadTracker::new());
 
-    Ok(try!(Cfg::from_env(shared_ntfy!(move |n: Notification| { 
+    Ok(try!(Cfg::from_env(Arc::new(move |n: Notification| {
        if download_tracker.borrow_mut().handle_notification(&n) {
             return;
         }
@@ -212,7 +216,7 @@ pub fn update_all_channels(cfg: &Cfg, self_update: bool) -> Result<()> {
     Ok(())
 }
 
-fn rustc_version(toolchain: &Toolchain) -> String {
+pub fn rustc_version(toolchain: &Toolchain) -> String {
     if toolchain.exists() {
         let rustc_path = toolchain.binary_file("rustc");
         if utils::is_file(&rustc_path) {
@@ -238,54 +242,42 @@ fn rustc_version(toolchain: &Toolchain) -> String {
     }
 }
 
-pub fn show_tool_versions(toolchain: &Toolchain) -> Result<()> {
-    if toolchain.exists() {
-        let rustc_path = toolchain.binary_file("rustc");
-        let cargo_path = toolchain.binary_file("cargo");
-
-        if utils::is_file(&rustc_path) {
-            let mut cmd = Command::new(&rustc_path);
-            cmd.arg("--version");
-            toolchain.set_ldpath(&mut cmd);
-
-            if utils::cmd_status("rustc", &mut cmd).is_err() {
-                println!("(failed to run rustc)");
+pub fn list_targets(toolchain: &Toolchain) -> Result<()> {
+    let mut t = term2::stdout();
+    for component in try!(toolchain.list_components()) {
+        if component.component.pkg == "rust-std" {
+            let target = component.component.target.as_ref().expect("rust-std should have a target");
+            if component.required {
+                let _ = t.attr(term2::Attr::Bold);
+                let _ = writeln!(t, "{} (default)", target);
+                let _ = t.reset();
+            } else if component.installed {
+                let _ = t.attr(term2::Attr::Bold);
+                let _ = writeln!(t, "{} (installed)", target);
+                let _ = t.reset();
+            } else if component.available {
+                let _ = writeln!(t, "{}", target);
             }
-        } else {
-            println!("(no rustc command in toolchain?)");
         }
-        if utils::is_file(&cargo_path) {
-            let mut cmd = Command::new(&cargo_path);
-            cmd.arg("--version");
-            // cargo invokes rustc during --version, this
-            // makes sure it can find it since it may not
-            // be on the `PATH` and multirust does not
-            // manipulate `PATH`.
-            cmd.env("RUSTC", rustc_path);
-            toolchain.set_ldpath(&mut cmd);
-
-            if utils::cmd_status("cargo", &mut cmd).is_err() {
-                println!("(failed to run cargo)");
-            }
-        } else {
-            println!("(no cargo command in toolchain?)");
-        }
-    } else {
-        println!("(toolchain not installed)");
     }
+
     Ok(())
 }
 
-pub fn list_targets(toolchain: &Toolchain) -> Result<()> {
+pub fn list_components(toolchain: &Toolchain) -> Result<()> {
+    let mut t = term2::stdout();
     for component in try!(toolchain.list_components()) {
-        if component.component.pkg == "rust-std" {
-            if component.required {
-                println!("{} (default)", component.component.target);
-            } else if component.installed {
-                println!("{} (installed)", component.component.target);
-            } else {
-                println!("{}", component.component.target);
-            }
+        let name = component.component.name();
+        if component.required {
+            let _ = t.attr(term2::Attr::Bold);
+            let _ = writeln!(t, "{} (default)", name);
+            let _ = t.reset();
+        } else if component.installed {
+            let _ = t.attr(term2::Attr::Bold);
+            let _ = writeln!(t, "{} (installed)", name);
+            let _ = t.reset();
+        } else if component.available {
+            let _ = writeln!(t, "{}", name);
         }
     }
 
@@ -293,19 +285,17 @@ pub fn list_targets(toolchain: &Toolchain) -> Result<()> {
 }
 
 pub fn list_toolchains(cfg: &Cfg) -> Result<()> {
-    let mut toolchains = try!(cfg.list_toolchains());
-
-    toolchains.sort();
+    let toolchains = try!(cfg.list_toolchains());
 
     if toolchains.is_empty() {
         println!("no installed toolchains");
     } else {
         if let Ok(Some(def_toolchain)) = cfg.find_default() {
             for toolchain in toolchains {
-                let if_default = if def_toolchain.name() == &*toolchain { 
-                    " (default)" 
-                } else { 
-                    "" 
+                let if_default = if def_toolchain.name() == &*toolchain {
+                    " (default)"
+                } else {
+                    ""
                 };
                 println!("{}{}", &toolchain, if_default);
             }
@@ -320,19 +310,30 @@ pub fn list_toolchains(cfg: &Cfg) -> Result<()> {
 }
 
 pub fn list_overrides(cfg: &Cfg) -> Result<()> {
-    let mut overrides = try!(cfg.override_db.list());
-
-    overrides.sort();
+    let overrides = try!(cfg.settings_file.with(|s| Ok(s.overrides.clone())));
 
     if overrides.is_empty() {
         println!("no overrides");
     } else {
-        for o in overrides {
-            split_override::<String>(&o, ';').map(|li| 
-                println!("{:<40}\t{:<20}", 
-                         utils::format_path_for_display(&li.0), 
-                         li.1)
-            );
+        let mut any_not_exist = false;
+        for (k, v) in overrides {
+            let dir_exists = Path::new(&k).is_dir();
+            if !dir_exists {
+                any_not_exist = true;
+            }
+            println!("{:<40}\t{:<20}",
+                     utils::format_path_for_display(&k) +
+                     if dir_exists {
+                         ""
+                     } else {
+                         " (not a directory)"
+                     },
+                     v)
+        }
+        if any_not_exist {
+            println!("");
+            info!("you may remove overrides for non-existent directories with
+`rustup override unset --nonexistent`");
         }
     }
     Ok(())
@@ -341,15 +342,6 @@ pub fn list_overrides(cfg: &Cfg) -> Result<()> {
 
 pub fn version() -> &'static str {
     concat!(env!("CARGO_PKG_VERSION"), include_str!(concat!(env!("OUT_DIR"), "/commit-info.txt")))
-}
-
-fn split_override<T: FromStr>(s: &str, separator: char) -> Option<(T, T)> {
-    s.find(separator).and_then(|index| {
-        match (T::from_str(&s[..index]), T::from_str(&s[index + 1..])) {
-            (Ok(l), Ok(r)) => Some((l, r)),
-            _ => None
-        }
-    })
 }
 
 
@@ -361,9 +353,11 @@ pub fn report_error(e: &Error) {
     }
 
     if show_backtrace() {
-        info!("backtrace:");
-        println!("");
-        println!("{:?}", e.backtrace());
+        if let Some(backtrace) = e.backtrace() {
+            info!("backtrace:");
+            println!("");
+            println!("{:?}", backtrace);
+        }
     } else {
     }
 

@@ -7,13 +7,14 @@ extern crate rustup_mock;
 extern crate time;
 use rustup_mock::clitools::{self, Config, Scenario,
                                expect_stdout_ok, expect_stderr_ok,
-                               expect_ok, expect_err, run,
-                               this_host_triple};
+                               expect_ok, expect_err, expect_timeout_ok,
+                               run, this_host_triple};
 use rustup_utils::{raw, utils};
 
 use time::Duration;
 use std::ops::Sub;
 use std::ops::Add;
+use std::time::Duration as StdDuration;
 
 macro_rules! for_host { ($s: expr) => (&format!($s, this_host_triple())) }
 
@@ -107,6 +108,33 @@ fn upgrade_v2_metadata_to_v12() {
         expect_ok(config, &["rustup", "update", "nightly"]);
         expect_stdout_ok(config, &["rustc", "--version"],
                          "hash-n-2");
+    });
+}
+
+// Verifies the conversion from separate files to a single settings.toml
+#[test]
+fn upgrade_toml_settings() {
+    setup(&|config| {
+        rustup_utils::raw::write_file(&config.rustupdir.join("version"), "2").unwrap();
+        rustup_utils::raw::write_file(&config.rustupdir.join("default"), "beta").unwrap();
+        rustup_utils::raw::write_file(&config.rustupdir.join("overrides"),
+                                      "a;nightly\nb;stable").unwrap();
+        rustup_utils::raw::write_file(&config.rustupdir.join("telemetry-on"), "").unwrap();
+        expect_err(config, &["rustup", "default", "nightly"],
+                   "rustup's metadata is out of date. run `rustup self upgrade-data`");
+        // Replace the metadata version
+        assert!(!rustup_utils::raw::is_file(&config.rustupdir.join("version")));
+        assert!(!rustup_utils::raw::is_file(&config.rustupdir.join("default")));
+        assert!(!rustup_utils::raw::is_file(&config.rustupdir.join("overrides")));
+        assert!(!rustup_utils::raw::is_file(&config.rustupdir.join("telemetry-on")));
+        assert!(rustup_utils::raw::is_file(&config.rustupdir.join("settings.toml")));
+
+        let content = rustup_utils::raw::read_file(&config.rustupdir.join("settings.toml")).unwrap();
+        assert!(content.contains("version = \"2\""));
+        assert!(content.contains("[overrides]"));
+        assert!(content.contains("a = \"nightly"));
+        assert!(content.contains("b = \"stable"));
+        assert!(content.contains("telemetry = true"));
     });
 }
 
@@ -256,6 +284,19 @@ fn custom_toolchain_cargo_fallback_run() {
 }
 
 #[test]
+fn rustup_run_searches_path() {
+    setup(&|config| {
+        #[cfg(windows)]
+        let hello_cmd = &["rustup", "run", "nightly", "cmd", "/C", "echo hello"];
+        #[cfg(not(windows))]
+        let hello_cmd = &["rustup", "run", "nightly", "sh", "-c", "echo hello"];
+
+        expect_ok(config, &["rustup", "default", "nightly"]);
+        expect_stdout_ok(config, hello_cmd, "hello");
+    });
+}
+
+#[test]
 fn multirust_env_compat() {
     setup(&|config| {
         let mut cmd = clitools::cmd(config, "rustup", &["update", "nightly"]);
@@ -305,6 +346,16 @@ fn enabling_telemetry_and_compiling_creates_log() {
         let contents = out.unwrap();
         assert!(contents.count() > 0);
     });
+}
+
+#[test]
+fn telemetry_supports_huge_output() {
+    setup(&|config| {
+        expect_ok(config, &["rustup", "default", "stable"]);
+        expect_ok(config, &["rustup", "telemetry", "enable"]);
+        expect_timeout_ok(&config, StdDuration::from_secs(5), &["rustc", "--huge-output"]);
+        expect_stdout_ok(config, &["rustup", "telemetry", "analyze"], "'E0428': 10000")
+    })
 }
 
 #[test]

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::fmt::{self, Display};
 use temp;
 use rustup_utils;
-use rustup_utils::notify::{self, NotificationLevel, Notifyable};
+use rustup_utils::notify::{NotificationLevel};
 use manifest::Component;
 use dist::TargetTriple;
 use errors::*;
@@ -22,18 +22,24 @@ pub enum Notification<'a> {
     ExtensionNotInstalled(&'a Component),
     NonFatalError(&'a Error),
     MissingInstalledComponent(&'a str),
-    DownloadingComponent(&'a str, &'a TargetTriple, &'a TargetTriple),
-    InstallingComponent(&'a str, &'a TargetTriple, &'a TargetTriple),
+    DownloadingComponent(&'a str, &'a TargetTriple, Option<&'a TargetTriple>),
+    InstallingComponent(&'a str, &'a TargetTriple, Option<&'a TargetTriple>),
     DownloadingManifest(&'a str),
     DownloadingLegacyManifest,
+    ManifestChecksumFailedHack,
 }
 
-pub type NotifyHandler<'a> = notify::NotifyHandler<'a, for<'b> Notifyable<Notification<'b>>>;
-pub type SharedNotifyHandler =
-    notify::SharedNotifyHandler<for<'b> Notifyable<Notification<'b>>>;
+impl<'a> From<rustup_utils::Notification<'a>> for Notification<'a> {
+    fn from(n: rustup_utils::Notification<'a>) -> Notification<'a> {
+        Notification::Utils(n)
+    }
+}
 
-extend_notification!(Notification: rustup_utils::Notification, n => Notification::Utils(n));
-extend_notification!(Notification: temp::Notification, n => Notification::Temp(n));
+impl<'a> From<temp::Notification<'a>> for Notification<'a> {
+    fn from(n: temp::Notification<'a>) -> Notification<'a> {
+        Notification::Temp(n)
+    }
+}
 
 impl<'a> Notification<'a> {
     pub fn level(&self) -> NotificationLevel {
@@ -47,6 +53,7 @@ impl<'a> Notification<'a> {
             DownloadingComponent(_, _, _) |
             InstallingComponent(_, _, _) |
             ComponentAlreadyInstalled(_)  |
+            ManifestChecksumFailedHack |
             RollingBack | DownloadingManifest(_) => NotificationLevel::Info,
             CantReadUpdateHash(_) | ExtensionNotInstalled(_) |
             MissingInstalledComponent(_) => NotificationLevel::Warn,
@@ -63,8 +70,7 @@ impl<'a> Display for Notification<'a> {
             Utils(ref n) => n.fmt(f),
             Extracting(_, _) => write!(f, "extracting..."),
             ComponentAlreadyInstalled(ref c) => {
-                write!(f, "component '{}' for target '{}' is up to date",
-                       c.pkg, c.target)
+                write!(f, "component {} is up to date", c.description())
             }
             CantReadUpdateHash(path) => {
                 write!(f,
@@ -76,26 +82,27 @@ impl<'a> Display for Notification<'a> {
             SignatureValid(_) => write!(f, "signature valid"),
             RollingBack => write!(f, "rolling back changes"),
             ExtensionNotInstalled(c) => {
-                write!(f, "extension '{}-{}' was not installed", c.pkg, c.target)
+                write!(f, "extension '{}' was not installed", c.name())
             }
             NonFatalError(e) => write!(f, "{}", e),
             MissingInstalledComponent(c) => write!(f, "during uninstall component {} was not found", c),
             DownloadingComponent(c, h, t) => {
-                if h == t {
+                if Some(h) == t || t.is_none() {
                     write!(f, "downloading component '{}'", c)
                 } else {
-                    write!(f, "downloading component '{}' for '{}'", c, t)
+                    write!(f, "downloading component '{}' for '{}'", c, t.unwrap())
                 }
             }
             InstallingComponent(c, h, t) => {
-                if h == t {
+                if Some(h) == t || t.is_none() {
                     write!(f, "installing component '{}'", c)
                 } else {
-                    write!(f, "installing component '{}' for '{}'", c, t)
+                    write!(f, "installing component '{}' for '{}'", c, t.unwrap())
                 }
             }
             DownloadingManifest(t) => write!(f, "syncing channel updates for '{}'", t),
             DownloadingLegacyManifest => write!(f, "manifest not found. trying legacy manifest"),
+            ManifestChecksumFailedHack => write!(f, "update not yet available, sorry! try again later"),
         }
     }
 }

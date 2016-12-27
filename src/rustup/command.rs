@@ -1,10 +1,10 @@
-use std::env;
 use std::ffi::OsStr;
-use std::io::{self, Write, BufRead, BufReader};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Write, BufRead, BufReader, Seek, SeekFrom};
 use std::process::{self, Command, Stdio};
 use std::time::Instant;
 use regex::Regex;
+use tempfile::tempfile;
 
 use Cfg;
 use errors::*;
@@ -14,45 +14,57 @@ use telemetry::{Telemetry, TelemetryEvent};
 
 
 pub fn run_command_for_dir<S: AsRef<OsStr>>(cmd: Command,
+                                            arg0: &str,
                                             args: &[S],
                                             cfg: &Cfg) -> Result<()> {
-    let arg0 = env::args().next().map(|a| PathBuf::from(a));
-    let arg0 = arg0.as_ref()
-        .and_then(|a| a.file_name())
-        .and_then(|a| a.to_str());
-    let arg0 = try!(arg0.ok_or(ErrorKind::NoExeName));
-    if (arg0 == "rustc" || arg0 == "rustc.exe") && cfg.telemetry_enabled() {
-        return telemetry_rustc(cmd, &args, &cfg);
+    if (arg0 == "rustc" || arg0 == "rustc.exe") && try!(cfg.telemetry_enabled()) {
+        return telemetry_rustc(cmd, arg0, args, cfg);
     }
-    
-    run_command_for_dir_without_telemetry(cmd, &args)
+
+    run_command_for_dir_without_telemetry(cmd, arg0, args)
 }
 
-fn telemetry_rustc<S: AsRef<OsStr>>(mut cmd: Command, args: &[S], cfg: &Cfg) -> Result<()> {
+fn telemetry_rustc<S: AsRef<OsStr>>(mut cmd: Command,
+                                    arg0: &str,
+                                    args: &[S], cfg: &Cfg) -> Result<()> {
+    #[cfg(unix)]
+    fn file_as_stdio(file: &File) -> Stdio {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        unsafe { Stdio::from_raw_fd(file.as_raw_fd()) }
+    }
+
+    #[cfg(windows)]
+    fn file_as_stdio(file: &File) -> Stdio {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        unsafe { Stdio::from_raw_handle(file.as_raw_handle()) }
+    }
+
     let now = Instant::now();
-    
-    cmd.args(&args[1..]);
-    
-    let has_color_args = (&args).iter().any(|e| {
+
+    cmd.args(args);
+
+    let has_color_args = args.iter().any(|e| {
         let e = e.as_ref().to_str().unwrap_or("");
         e.starts_with("--color")
     });
-    
+
     if stderr_isatty() && !has_color_args
     {
         cmd.arg("--color");
-        cmd.arg("always"); 
+        cmd.arg("always");
     }
+
+    let mut cmd_err_file = tempfile().unwrap();
+    let cmd_err_stdio = file_as_stdio(&cmd_err_file);
 
     // FIXME rust-lang/rust#32254. It's not clear to me
     // when and why this is needed.
     let mut cmd = cmd.stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
-                    .stderr(Stdio::piped())
+                    .stderr(cmd_err_stdio)
                     .spawn()
                     .unwrap();
 
-    let mut buffered_stderr = BufReader::new(cmd.stderr.take().unwrap());
     let status = cmd.wait();
 
     let duration = now.elapsed();
@@ -75,33 +87,30 @@ fn telemetry_rustc<S: AsRef<OsStr>>(mut cmd: Command, args: &[S], cfg: &Cfg) -> 
             let stderr = io::stderr();
             let mut handle = stderr.lock();
 
+            cmd_err_file.seek(SeekFrom::Start(0)).unwrap();
+
+            let mut buffered_stderr = BufReader::new(cmd_err_file);
+
             while buffered_stderr.read_line(&mut buffer).unwrap() > 0 {
                 let b = buffer.to_owned();
-                buffer.clear();                
+                buffer.clear();
                 let _ = handle.write(b.as_bytes());
 
-                let c = re.captures(&b);
-                match c {
-                    None => continue,
-                    Some(caps) => {
-                        if caps.len() > 0 {
-                            let _ = errors.push(caps.name("error").unwrap_or("").to_owned());
-                        }
+                if let Some(caps) = re.captures(&b) {
+                    if !caps.is_empty() {
+                        errors.push(caps.name("error").unwrap_or("").to_owned());
                     }
                 };
             }
 
-            let e = match errors.len() { 
-                0 => None,
-                _ => Some(errors),
-            };
+            let e = if errors.is_empty() { None } else { Some(errors) };
 
-            let te = TelemetryEvent::RustcRun { duration_ms: ms, 
+            let te = TelemetryEvent::RustcRun { duration_ms: ms,
                                                 exit_code: exit_code,
                                                 errors: e };
-            
+
             let _ = t.log_telemetry(te).map_err(|xe| {
-                cfg.notify_handler.call(Notification::TelemetryCleanupError(&xe));
+                (cfg.notify_handler)(Notification::TelemetryCleanupError(&xe));
             });
 
             process::exit(exit_code);
@@ -111,20 +120,22 @@ fn telemetry_rustc<S: AsRef<OsStr>>(mut cmd: Command, args: &[S], cfg: &Cfg) -> 
             let te = TelemetryEvent::RustcRun { duration_ms: ms,
                                                 exit_code: exit_code,
                                                 errors: None };
-            
+
             let _ = t.log_telemetry(te).map_err(|xe| {
-                cfg.notify_handler.call(Notification::TelemetryCleanupError(&xe));
+                (cfg.notify_handler)(Notification::TelemetryCleanupError(&xe));
             });
 
             Err(e).chain_err(|| rustup_utils::ErrorKind::RunningCommand {
-                name: args[0].as_ref().to_owned(),
+                name: OsStr::new(arg0).to_owned(),
             })
         },
     }
 }
 
-fn run_command_for_dir_without_telemetry<S: AsRef<OsStr>>(mut cmd: Command, args: &[S]) -> Result<()>  {
-    cmd.args(&args[1..]);
+fn run_command_for_dir_without_telemetry<S: AsRef<OsStr>>(
+    mut cmd: Command, arg0: &str, args: &[S]) -> Result<()>
+{
+    cmd.args(&args);
 
     // FIXME rust-lang/rust#32254. It's not clear to me
     // when and why this is needed.
@@ -138,10 +149,10 @@ fn run_command_for_dir_without_telemetry<S: AsRef<OsStr>>(mut cmd: Command, args
         }
         Err(e) => {
             Err(e).chain_err(|| rustup_utils::ErrorKind::RunningCommand {
-                name: args[0].as_ref().to_owned(),
+                name: OsStr::new(arg0).to_owned(),
             })
         }
-    }    
+    }
 }
 
 #[cfg(unix)]

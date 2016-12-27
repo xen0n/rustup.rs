@@ -5,25 +5,25 @@ use std::io::{self, Write};
 use std::process::Command;
 use std::ffi::OsString;
 use std::env;
-use hyper;
 use sha2::Sha256;
-use notify::Notifyable;
-use notifications::{Notification, NotifyHandler};
+use notifications::{Notification};
 use raw;
 #[cfg(windows)]
 use winapi::DWORD;
 #[cfg(windows)]
 use winreg;
+use std::cmp::Ord;
+use url::Url;
 
 pub use raw::{is_directory, is_file, path_exists, if_not_empty, random_string, prefix_arg,
                     has_cmd, find_cmd};
 
 pub fn ensure_dir_exists(name: &'static str,
                          path: &Path,
-                         notify_handler: NotifyHandler)
+                         notify_handler: &Fn(Notification))
                          -> Result<bool> {
     raw::ensure_dir_exists(path,
-                           |p| notify_handler.call(Notification::CreatingDirectory(name, p)))
+                           |p| notify_handler(Notification::CreatingDirectory(name, p)))
         .chain_err(|| {
             ErrorKind::CreatingDirectory {
                 name: name,
@@ -123,9 +123,9 @@ pub fn match_file<T, F: FnMut(&str) -> Option<T>>(name: &'static str,
     })
 }
 
-pub fn canonicalize_path(path: &Path, notify_handler: NotifyHandler) -> PathBuf {
+pub fn canonicalize_path(path: &Path, notify_handler: &Fn(Notification)) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| {
-        notify_handler.call(Notification::NoCanonicalPath(path));
+        notify_handler(Notification::NoCanonicalPath(path));
         PathBuf::from(path)
     })
 }
@@ -139,34 +139,94 @@ pub fn tee_file<W: io::Write>(name: &'static str, path: &Path, w: &mut W) -> Res
     })
 }
 
-pub fn download_file(url: hyper::Url,
+pub fn download_file(url: &Url,
                      path: &Path,
                      hasher: Option<&mut Sha256>,
-                     notify_handler: NotifyHandler)
+                     notify_handler: &Fn(Notification))
                      -> Result<()> {
-    use hyper::status::StatusCode::NotFound;
-
-    notify_handler.call(Notification::DownloadingFile(&url, path));
-    match raw::download_file(url.clone(), path, hasher, notify_handler) {
+    use download::ErrorKind as DEK;
+    match download_file_(url, path, hasher, notify_handler) {
         Ok(_) => Ok(()),
-        Err(e @ Error(ErrorKind::HttpStatus(NotFound), _)) => {
-            Err(e).chain_err(|| ErrorKind::Download404 {
-                url: url,
-                path: path.to_path_buf(),
-            })
-        }
         Err(e) => {
-            Err(e).chain_err(|| ErrorKind::DownloadingFile {
-                url: url,
-                path: path.to_path_buf(),
+            let is_client_error = match e.kind() {
+                &ErrorKind::Download(DEK::HttpStatus(400 ... 499)) => true,
+                &ErrorKind::Download(DEK::FileNotFound) => true,
+                _ => false
+            };
+            Err(e).chain_err(|| if is_client_error {
+                ErrorKind::DownloadNotExists {
+                    url: url.clone(),
+                    path: path.to_path_buf(),
+                }
+            } else {
+                ErrorKind::DownloadingFile {
+                    url: url.clone(),
+                    path: path.to_path_buf(),
+                }
             })
         }
     }
 }
 
-pub fn parse_url(url: &str) -> Result<hyper::Url> {
-    hyper::Url::parse(url)
-            .chain_err(|| ErrorKind::InvalidUrl { url: url.to_owned() })
+fn download_file_(url: &Url,
+                  path: &Path,
+                  hasher: Option<&mut Sha256>,
+                  notify_handler: &Fn(Notification))
+                  -> Result<()> {
+
+    use sha2::Digest;
+    use std::cell::RefCell;
+    use download::download_to_path_with_backend;
+    use download::{self, Event, Backend};
+
+    notify_handler(Notification::DownloadingFile(url, path));
+
+    let hasher = RefCell::new(hasher);
+
+    // This callback will write the download to disk and optionally
+    // hash the contents, then forward the notification up the stack
+    let callback: &Fn(Event) -> download::Result<()> = &|msg| {
+        match msg {
+            Event::DownloadDataReceived(data) => {
+                if let Some(ref mut h) = *hasher.borrow_mut() {
+                    h.input(data);
+                }
+            }
+            _ => ()
+        }
+
+        match msg {
+            Event::DownloadContentLengthReceived(len) => {
+                notify_handler(Notification::DownloadContentLengthReceived(len));
+            }
+            Event::DownloadDataReceived(data) => {
+                notify_handler(Notification::DownloadDataReceived(data));
+            }
+        }
+
+        Ok(())
+    };
+
+    // Download the file
+    let use_hyper_backend = env::var_os("RUSTUP_USE_HYPER").is_some();
+    let use_rustls_backend = env::var_os("RUSTUP_USE_RUSTLS").is_some();
+    let (backend, notification) = if use_hyper_backend {
+        (Backend::Hyper, Notification::UsingHyper)
+    } else if use_rustls_backend {
+        (Backend::Rustls, Notification::UsingRustls)
+    } else {
+        (Backend::Curl, Notification::UsingCurl)
+    };
+    notify_handler(notification);
+    try!(download_to_path_with_backend(backend, url, path, Some(callback)));
+
+    notify_handler(Notification::DownloadFinished);
+
+    Ok(())
+}
+
+pub fn parse_url(url: &str) -> Result<Url> {
+    Url::parse(url).chain_err(|| format!("failed to parse url: {}", url))
 }
 
 pub fn cmd_status(name: &'static str, cmd: &mut Command) -> Result<()> {
@@ -193,8 +253,8 @@ pub fn assert_is_directory(path: &Path) -> Result<()> {
     }
 }
 
-pub fn symlink_dir(src: &Path, dest: &Path, notify_handler: NotifyHandler) -> Result<()> {
-    notify_handler.call(Notification::LinkingDirectory(src, dest));
+pub fn symlink_dir(src: &Path, dest: &Path, notify_handler: &Fn(Notification)) -> Result<()> {
+    notify_handler(Notification::LinkingDirectory(src, dest));
     raw::symlink_dir(src, dest).chain_err(|| {
         ErrorKind::LinkingDirectory {
             src: PathBuf::from(src),
@@ -212,8 +272,8 @@ pub fn hardlink_file(src: &Path, dest: &Path) -> Result<()> {
     })
 }
 
-pub fn copy_dir(src: &Path, dest: &Path, notify_handler: NotifyHandler) -> Result<()> {
-    notify_handler.call(Notification::CopyingDirectory(src, dest));
+pub fn copy_dir(src: &Path, dest: &Path, notify_handler: &Fn(Notification)) -> Result<()> {
+    notify_handler(Notification::CopyingDirectory(src, dest));
     raw::copy_dir(src, dest).chain_err(|| {
         ErrorKind::CopyingDirectory {
             src: PathBuf::from(src),
@@ -233,8 +293,8 @@ pub fn copy_file(src: &Path, dest: &Path) -> Result<()> {
         .map(|_| ())
 }
 
-pub fn remove_dir(name: &'static str, path: &Path, notify_handler: NotifyHandler) -> Result<()> {
-    notify_handler.call(Notification::RemovingDirectory(name, path));
+pub fn remove_dir(name: &'static str, path: &Path, notify_handler: &Fn(Notification)) -> Result<()> {
+    notify_handler(Notification::RemovingDirectory(name, path));
     raw::remove_dir(path).chain_err(|| {
         ErrorKind::RemovingDirectory {
             name: name,
@@ -419,7 +479,8 @@ pub fn cargo_home() -> Result<PathBuf> {
     let env_var = if let Some(v) = env_var {
        let vv = v.to_string_lossy().to_string();
        if vv.contains(".multirust/cargo") ||
-            vv.contains(r".multirust\cargo") {
+            vv.contains(r".multirust\cargo") ||
+            vv.trim().is_empty() {
            None
        } else {
            Some(v)
@@ -436,18 +497,207 @@ pub fn cargo_home() -> Result<PathBuf> {
     cargo_home.or(user_home).ok_or(ErrorKind::CargoHome.into())
 }
 
+// Convert the ~/.multirust folder to ~/.rustup while dealing with rustup.sh
+// metadata, which used to also live in ~/.rustup, but now lives in ~/rustup.sh.
+pub fn do_rustup_home_upgrade() -> bool {
+
+    fn rustup_home_is_set() -> bool {
+        env::var_os("RUSTUP_HOME").is_some()
+    }
+
+    fn rustup_dir() -> Option<PathBuf> {
+        dot_dir(".rustup")
+    }
+
+    fn rustup_sh_dir() -> Option<PathBuf> {
+        dot_dir(".rustup.sh")
+    }
+
+    fn multirust_dir() -> Option<PathBuf> {
+        dot_dir(".multirust")
+    }
+
+    fn rustup_dir_exists() -> bool {
+        rustup_dir().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    fn rustup_sh_dir_exists() -> bool {
+        rustup_sh_dir().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    fn multirust_dir_exists() -> bool {
+        multirust_dir().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    fn rustup_old_version_exists() -> bool {
+        rustup_dir()
+            .map(|p| p.join("rustup-version").exists())
+            .unwrap_or(false)
+    }
+
+    fn delete_rustup_dir() -> Result<()> {
+        if let Some(dir) = rustup_dir() {
+            raw::remove_dir(&dir)
+                .chain_err(|| "unable to delete rustup dir")?;
+        }
+
+        Ok(())
+    }
+
+    fn rename_rustup_dir_to_rustup_sh() -> Result<()> {
+        let dirs = (rustup_dir(), rustup_sh_dir());
+        if let (Some(rustup), Some(rustup_sh)) = dirs {
+            fs::rename(&rustup, &rustup_sh)
+                .chain_err(|| "unable to rename rustup dir")?;
+        }
+
+        Ok(())
+    }
+
+    fn rename_multirust_dir_to_rustup() -> Result<()> {
+        let dirs = (multirust_dir(), rustup_dir());
+        if let (Some(rustup), Some(rustup_sh)) = dirs {
+            fs::rename(&rustup, &rustup_sh)
+                .chain_err(|| "unable to rename multirust dir")?;
+        }
+
+        Ok(())
+    }
+
+    // If RUSTUP_HOME is set then its default path doesn't matter, so we're
+    // not going to risk doing any I/O work and making a mess.
+    if rustup_home_is_set() { return true }
+
+    // Now we are just trying to get a bogus, rustup.sh-created ~/.rustup out
+    // of the way in the manner that is least likely to take time and generate
+    // errors. First try to rename it to ~/.rustup.sh, then try to delete it.
+    // If that doesn't work we can't use the ~/.rustup name.
+    let old_rustup_dir_removed = if rustup_old_version_exists() {
+        if !rustup_sh_dir_exists() {
+            if rename_rustup_dir_to_rustup_sh().is_ok() {
+                true
+            } else {
+                if delete_rustup_dir().is_ok() {
+                    true
+                } else {
+                    false
+                }
+            }
+        } else {
+            if delete_rustup_dir().is_ok() {
+                true
+            } else {
+                false
+            }
+        }
+    } else {
+        true
+    };
+
+    // Now we're trying to move ~/.multirust to ~/.rustup
+    old_rustup_dir_removed && if multirust_dir_exists() {
+        if rustup_dir_exists() {
+            // There appears to be both a ~/.multirust dir and a valid ~/.rustup
+            // dir. Most likely because one is a symlink to the other, as configured
+            // below.
+            true
+        } else {
+            if rename_multirust_dir_to_rustup().is_ok() {
+                // Finally, making the hardlink from ~/.multirust back to
+                // ~/.rustup, for temporary compatibility.
+                let _ = create_legacy_multirust_symlink();
+                true
+            } else {
+                false
+            }
+        }
+    } else {
+        true
+    }
+}
+
+// Creates a ~/.rustup folder and a ~/.multirust symlink
+pub fn create_rustup_home() -> Result<()> {
+    // If there's an existing install, then try to upgrade
+    do_rustup_home_upgrade();
+
+    // If RUSTUP_HOME is set then don't make any assumptions about where it's
+    // ok to put ~/.multirust
+    if env::var_os("RUSTUP_HOME").is_some() { return Ok(()) }
+
+    let home = rustup_home_in_user_dir()?;
+    fs::create_dir_all(&home)
+        .chain_err(|| "unable to create ~/.rustup")?;
+
+    // This is a temporary compatibility symlink
+    create_legacy_multirust_symlink()?;
+
+    Ok(())
+}
+
+// Create a symlink from ~/.multirust to ~/.rustup to temporarily
+// accomodate old tools that are expecting that directory
+fn create_legacy_multirust_symlink() -> Result<()> {
+    let newhome = rustup_home_in_user_dir()?;
+    let oldhome = legacy_multirust_home()?;
+
+    if oldhome.exists() {
+        return Ok(());
+    }
+
+    raw::symlink_dir(&newhome, &oldhome)
+        .chain_err(|| format!("unable to symlink {} from {}",
+                              newhome.display(), oldhome.display()))?;
+
+    Ok(())
+}
+
+pub fn delete_legacy_multirust_symlink() -> Result<()> {
+    let oldhome = legacy_multirust_home()?;
+
+    if oldhome.exists() {
+        let meta = fs::symlink_metadata(&oldhome)
+            .chain_err(|| "unable to get metadata for ~/.multirust")?;
+        if meta.file_type().is_symlink() {
+            // remove_dir handles unlinking symlinks
+            raw::remove_dir(&oldhome)
+                .chain_err(|| format!("unable to delete legacy symlink {}", oldhome.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn dot_dir(name: &str) -> Option<PathBuf> {
+    home_dir().map(|p| p.join(name))
+}
+
+pub fn legacy_multirust_home() -> Result<PathBuf> {
+    dot_dir(".multirust").ok_or(ErrorKind::MultirustHome.into())
+}
+
+pub fn rustup_home_in_user_dir() -> Result<PathBuf> {
+    dot_dir(".rustup").ok_or(ErrorKind::MultirustHome.into())
+}
+
 pub fn multirust_home() -> Result<PathBuf> {
+    let use_rustup_dir = do_rustup_home_upgrade();
+
     let cwd = try!(env::current_dir().chain_err(|| ErrorKind::MultirustHome));
     let multirust_home = env::var_os("RUSTUP_HOME").map(|home| {
         cwd.join(home)
     });
-    let user_home = home_dir().map(|p| p.join(".multirust"));
+    let user_home = if use_rustup_dir {
+        dot_dir(".rustup")
+    } else {
+        dot_dir(".multirust")
+    };
     multirust_home.or(user_home).ok_or(ErrorKind::MultirustHome.into())
 }
 
 pub fn format_path_for_display(path: &str) -> String {
     let unc_present = path.find(r"\\?\");
-    
+
     match unc_present {
         None => path.to_owned(),
         Some(_) => path[4..].to_owned(),
@@ -487,5 +737,72 @@ pub fn string_from_winreg_value(val: &winreg::RegValue) -> Option<String> {
             Some(s)
         }
         _ => None
+    }
+}
+
+pub fn toolchain_sort<T: AsRef<str>>(v: &mut Vec<T>) {
+    use semver::{Version, Identifier};
+
+    fn special_version(ord: u64, s: &str) -> Version {
+        Version {
+            major: 0,
+            minor: 0,
+            patch: 0,
+            pre: vec![Identifier::Numeric(ord), Identifier::AlphaNumeric(s.into())],
+            build: vec![],
+        }
+    }
+
+    fn toolchain_sort_key(s: &str) -> Version {
+        if s.starts_with("stable") {
+            special_version(0, s)
+        } else if s.starts_with("beta") {
+            special_version(1, s)
+        } else if s.starts_with("nightly") {
+            special_version(2, s)
+        } else {
+            Version::parse(&s.replace("_", "-")).unwrap_or_else(|_| special_version(3, s))
+        }
+    }
+
+    v.sort_by(|a, b| {
+        let a_str: &str = a.as_ref();
+        let b_str: &str = b.as_ref();
+        let a_key = toolchain_sort_key(a_str);
+        let b_key = toolchain_sort_key(b_str);
+        a_key.cmp(&b_key)
+    });
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_toochain_sort() {
+        let expected = vec![
+            "stable-x86_64-unknown-linux-gnu",
+            "beta-x86_64-unknown-linux-gnu",
+            "nightly-x86_64-unknown-linux-gnu",
+            "1.0.0-x86_64-unknown-linux-gnu",
+            "1.2.0-x86_64-unknown-linux-gnu",
+            "1.8.0-x86_64-unknown-linux-gnu",
+            "1.10.0-x86_64-unknown-linux-gnu",
+        ];
+
+        let mut v = vec![
+            "1.8.0-x86_64-unknown-linux-gnu",
+            "1.0.0-x86_64-unknown-linux-gnu",
+            "nightly-x86_64-unknown-linux-gnu",
+            "stable-x86_64-unknown-linux-gnu",
+            "1.10.0-x86_64-unknown-linux-gnu",
+            "beta-x86_64-unknown-linux-gnu",
+            "1.2.0-x86_64-unknown-linux-gnu",
+        ];
+
+        toolchain_sort(&mut v);
+
+        assert_eq!(expected, v);
     }
 }

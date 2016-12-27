@@ -10,8 +10,9 @@ use std::fs;
 use tempdir::TempDir;
 use rustup_mock::clitools::{self, Config, Scenario,
                                expect_ok, expect_stdout_ok, expect_err,
-                               expect_stderr_ok, set_current_dist_date,
-                               change_dir, this_host_triple};
+                               expect_stderr_ok, expect_not_stdout_ok,
+                               set_current_dist_date, change_dir,
+                               this_host_triple};
 
 use rustup_dist::dist::TargetTriple;
 
@@ -101,6 +102,20 @@ fn list_toolchains() {
                          "nightly");
         expect_stdout_ok(config, &["rustup", "toolchain", "list"],
                          "beta-2015-01-01");
+    });
+}
+
+#[test]
+fn list_toolchains_with_bogus_file() {
+    // #520
+    setup(&|config| {
+        expect_ok(config, &["rustup", "update", "nightly"]);
+
+        let name = "bogus_regular_file.txt";
+        let path = config.rustupdir.join("toolchains").join(name);
+        rustup_utils::utils::write_file(name, &path, "").unwrap();
+        expect_stdout_ok(config, &["rustup", "toolchain", "list"], "nightly");
+        expect_not_stdout_ok(config, &["rustup", "toolchain", "list"], name);
     });
 }
 
@@ -520,7 +535,7 @@ fn add_target_again() {
 #[test]
 fn add_target_host() {
     setup(&|config| {
-        let trip = TargetTriple::from_host();
+        let trip = TargetTriple::from_build();
         expect_ok(config, &["rustup", "default", "nightly"]);
         expect_err(config, &["rustup", "target", "add", &trip.to_string()],
                    for_host!("component 'rust-std' for target '{0}' is required for toolchain 'nightly-{0}' and cannot be re-added"));
@@ -534,6 +549,12 @@ fn remove_target() {
         expect_ok(config, &["rustup", "target", "add", clitools::CROSS_ARCH1]);
         expect_ok(config, &["rustup", "target", "remove", clitools::CROSS_ARCH1]);
         let path = format!("toolchains/nightly-{}/lib/rustlib/{}/lib/libstd.rlib",
+                           this_host_triple(), clitools::CROSS_ARCH1);
+        assert!(!config.rustupdir.join(path).exists());
+        let path = format!("toolchains/nightly-{}/lib/rustlib/{}/lib",
+                           this_host_triple(), clitools::CROSS_ARCH1);
+        assert!(!config.rustupdir.join(path).exists());
+        let path = format!("toolchains/nightly-{}/lib/rustlib/{}",
                            this_host_triple(), clitools::CROSS_ARCH1);
         assert!(!config.rustupdir.join(path).exists());
     });
@@ -603,7 +624,7 @@ fn remove_target_again() {
 #[test]
 fn remove_target_host() {
     setup(&|config| {
-        let trip = TargetTriple::from_host();
+        let trip = TargetTriple::from_build();
         expect_ok(config, &["rustup", "default", "nightly"]);
         expect_err(config, &["rustup", "target", "remove", &trip.to_string()],
                    for_host!("component 'rust-std' for target '{0}' is required for toolchain 'nightly-{0}' and cannot be removed"));
@@ -634,7 +655,7 @@ fn make_component_unavailable(config: &Config, name: &str, target: &TargetTriple
 #[test]
 fn update_unavailable_std() {
     setup(&|config| {
-        let ref trip = TargetTriple::from_host();
+        let ref trip = TargetTriple::from_build();
         make_component_unavailable(config, "rust-std", trip);
         expect_err(config, &["rustup", "update", "nightly"],
                    &format!("component 'rust-std' for '{}' is unavailable for download", trip));

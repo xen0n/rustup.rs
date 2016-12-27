@@ -18,13 +18,13 @@ set -u
 RUSTUP_UPDATE_ROOT="https://static.rust-lang.org/rustup/dist"
 
 main() {
+    need_cmd uname
     need_cmd curl
     need_cmd mktemp
     need_cmd chmod
     need_cmd mkdir
     need_cmd rm
     need_cmd rmdir
-    need_cmd printf
 
     get_architecture || return 1
     local _arch="$RETVAL"
@@ -32,21 +32,41 @@ main() {
 
     local _ext=""
     case "$_arch" in
-	*windows*)
-	    _ext=".exe"
-	    ;;
+        *windows*)
+            _ext=".exe"
+            ;;
     esac
 
     local _url="$RUSTUP_UPDATE_ROOT/$_arch/rustup-init$_ext"
 
     local _dir="$(mktemp -d 2>/dev/null || ensure mktemp -d -t rustup)"
     local _file="$_dir/rustup-init$_ext"
-
-    printf "\33[1minfo:\33[0m downloading installer\n"
-
+    
+    local _ansi_escapes_are_valid=false
+    if [ -t 2 ]; then
+        if [ "${TERM+set}" = 'set' ]; then
+            case "$TERM" in
+                xterm*|rxvt*|urxvt*|linux*|vt*)
+                    _ansi_escapes_are_valid=true
+                ;;
+            esac
+        fi
+    fi
+    
+    if $_ansi_escapes_are_valid; then
+        printf "\33[1minfo:\33[0m downloading installer\n" 1>&2
+    else
+        printf '%s\n' 'info: downloading installer' 1>&2
+    fi
+    
     ensure mkdir -p "$_dir"
     ensure curl -sSfL "$_url" -o "$_file"
     ensure chmod u+x "$_file"
+    if [ ! -x "$_file" ]; then
+        printf '%s\n' "Cannot execute $_file (likely because of mounting /tmp as noexec)." 1>&2
+        printf '%s\n' "Please copy the file to a location where you can execute binaries and run ./rustup-init$_ext." 1>&2
+        exit 1
+    fi
 
     # check if we have to use /dev/tty to prompt the user
     local need_tty=yes
@@ -84,6 +104,43 @@ main() {
     return "$_retval"
 }
 
+get_bitness() {
+    need_cmd head
+    # Architecture detection without dependencies beyond coreutils.
+    # ELF files start out "\x7fELF", and the following byte is
+    #   0x01 for 32-bit and
+    #   0x02 for 64-bit.
+    # The printf builtin on some shells like dash only supports octal
+    # escape sequences, so we use those.
+    local _current_exe_head=$(head -c 5 /proc/self/exe )
+    if [ "$_current_exe_head" = "$(printf '\177ELF\001')" ]; then
+        echo 32
+    elif [ "$_current_exe_head" = "$(printf '\177ELF\002')" ]; then
+        echo 64
+    else
+        err "unknown platform bitness"
+    fi
+}
+
+get_endianness() {
+    local cputype=$1
+    local suffix_eb=$2
+    local suffix_el=$3
+
+    # detect endianness without od/hexdump, like get_bitness() does.
+    need_cmd head
+    need_cmd tail
+
+    local _current_exe_endianness="$(head -c 6 /proc/self/exe | tail -c 1)"
+    if [ "$_current_exe_endianness" = "$(printf '\001')" ]; then
+        echo "${cputype}${suffix_el}"
+    elif [ "$_current_exe_endianness" = "$(printf '\002')" ]; then
+        echo "${cputype}${suffix_eb}"
+    else
+        err "unknown platform endianness"
+    fi
+}
+
 get_architecture() {
 
     local _ostype="$(uname -s)"
@@ -104,6 +161,10 @@ get_architecture() {
 
         FreeBSD)
             local _ostype=unknown-freebsd
+            ;;
+
+        NetBSD)
+            local _ostype=unknown-netbsd
             ;;
 
         DragonFly)
@@ -144,12 +205,44 @@ get_architecture() {
             local _ostype="${_ostype}eabihf"
             ;;
 
-	aarch64)
-	    local _cputype=aarch64
-	    ;;
+        aarch64)
+            local _cputype=aarch64
+            ;;
 
         x86_64 | x86-64 | x64 | amd64)
             local _cputype=x86_64
+            ;;
+
+        mips)
+            local _cputype="$(get_endianness $_cputype "" 'el')"
+            ;;
+
+        mips64)
+            local _bitness="$(get_bitness)"
+            if [ $_bitness = "32" ]; then
+                if [ $_ostype = "unknown-linux-gnu" ]; then
+                    # 64-bit kernel with 32-bit userland
+                    # endianness suffix is appended later
+                    local _cputype=mips
+                fi
+            else
+                # only n64 ABI is supported for now
+                local _ostype="${_ostype}abi64"
+            fi
+
+            local _cputype="$(get_endianness $_cputype "" 'el')"
+            ;;
+
+        ppc)
+            local _cputype=powerpc
+            ;;
+
+        ppc64)
+            local _cputype=powerpc64
+            ;;
+
+        ppc64le)
+            local _cputype=powerpc64le
             ;;
 
         *)
@@ -159,13 +252,18 @@ get_architecture() {
 
     # Detect 64-bit linux with 32-bit userland
     if [ $_ostype = unknown-linux-gnu -a $_cputype = x86_64 ]; then
-        local _bin_to_probe="/usr/bin/env"
-        if [ -e "$_bin_to_probe" ]; then
-            need_cmd file
-            file -L "$_bin_to_probe" | grep -q "x86[_-]64"
-            if [ $? != 0 ]; then
-                local _cputype=i686
-            fi
+        if [ "$(get_bitness)" = "32" ]; then
+            local _cputype=i686
+        fi
+    fi
+
+    # Detect armv7 but without the CPU features Rust needs in that build,
+    # and fall back to arm.
+    # See https://github.com/rust-lang-nursery/rustup.rs/issues/587.
+    if [ $_ostype = "unknown-linux-gnueabihf" -a $_cputype = armv7 ]; then
+        if ensure grep '^Features' /proc/cpuinfo | grep -q -v neon; then
+            # At least one processor does not have NEON.
+            local _cputype=arm
         fi
     fi
 

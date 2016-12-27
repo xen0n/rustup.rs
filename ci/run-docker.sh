@@ -18,8 +18,8 @@ export LD_LIBRARY_PATH=/travis-rust/lib:$LD_LIBRARY_PATH
 # distribute (this can be changed by others of course).
 # ==============================================================================
 
-OPENSSL_VERS=1.0.2h
-OPENSSL_SHA256=1d4007e53aad94a5b2002fe045ee7bb0b3d98f1a47f8b2bc851dcd1c74332919
+OPENSSL_VERS=1.0.2j
+OPENSSL_SHA256=e7aff292be21c259c6af26469c7a9b3ba26e9abaaffd325e3dccc9785256c431
 
 case $TARGET in
   x86_64-*-linux-*)
@@ -64,6 +64,47 @@ case $TARGET in
     OPENSSL_CC=x86_64-unknown-netbsd-gcc
     OPENSSL_AR=x86_64-unknown-netbsd-ar
     ;;
+  powerpc-*-linux-*)
+    OPENSSL_OS=linux-ppc
+    OPENSSL_CC=powerpc-linux-gnu-gcc
+    OPENSSL_AR=powerpc-linux-gnu-ar
+    ;;
+  powerpc64-*-linux-*)
+    OPENSSL_OS=linux-ppc64
+    OPENSSL_CC=powerpc64-linux-gnu-gcc-5
+    OPENSSL_AR=powerpc64-linux-gnu-ar
+    OPENSSL_CFLAGS=-m64
+    ;;
+  powerpc64le-*-linux-*)
+    OPENSSL_OS=linux-ppc64le
+    OPENSSL_CC=powerpc64le-linux-gnu-gcc
+    OPENSSL_AR=powerpc64le-linux-gnu-ar
+    ;;
+  mips-*-linux-*)
+    OPENSSL_OS=linux-mips32
+    OPENSSL_CC=mips-linux-gnu-gcc
+    OPENSSL_AR=mips-linux-gnu-ar
+    ;;
+  mipsel-*-linux-*)
+    OPENSSL_OS=linux-mips32
+    OPENSSL_CC=mipsel-linux-gnu-gcc
+    OPENSSL_AR=mipsel-linux-gnu-ar
+    ;;
+  mips64-*-linux-*)
+    OPENSSL_OS=linux64-mips64
+    OPENSSL_CC=mips64-linux-gnuabi64-gcc
+    OPENSSL_AR=mips64-linux-gnuabi64-ar
+    ;;
+  mips64el-*-linux-*)
+    OPENSSL_OS=linux64-mips64
+    OPENSSL_CC=mips64el-linux-gnuabi64-gcc
+    OPENSSL_AR=mips64el-linux-gnuabi64-ar
+    ;;
+  s390x-*-linux-*)
+    OPENSSL_OS=linux64-s390x
+    OPENSSL_CC=s390x-linux-gnu-gcc
+    OPENSSL_AR=s390x-linux-gnu-ar
+    ;;
   *)
     echo "can't cross compile OpenSSL for $TARGET"
     exit 1
@@ -73,7 +114,7 @@ esac
 mkdir -p target/$TARGET/openssl
 install=`pwd`/target/$TARGET/openssl/openssl-install
 out=`pwd`/target/$TARGET/openssl/openssl-$OPENSSL_VERS.tar.gz
-curl -o $out https://openssl.org/source/openssl-$OPENSSL_VERS.tar.gz
+curl -o $out https://www.openssl.org/source/openssl-$OPENSSL_VERS.tar.gz
 sha256sum $out > $out.sha256
 test $OPENSSL_SHA256 = `cut -d ' ' -f 1 $out.sha256`
 
@@ -88,9 +129,7 @@ tar xf $out -C target/$TARGET/openssl
 # Variables to the openssl-sys crate to link statically against the OpenSSL we
 # just compiled above
 export OPENSSL_STATIC=1
-export OPENSSL_ROOT_DIR=$install
-export OPENSSL_LIB_DIR=$install/lib
-export OPENSSL_INCLUDE_DIR=$install/include
+export OPENSSL_DIR=$install
 
 # ==============================================================================
 # Actually delgate to the test script itself

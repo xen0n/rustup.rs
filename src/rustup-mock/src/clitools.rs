@@ -3,22 +3,24 @@
 
 use std::path::{PathBuf, Path};
 use std::env;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::env::consts::EXE_SUFFIX;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::sync::Mutex;
+use std::time::Duration;
 use tempdir::TempDir;
 use {MockInstallerBuilder, MockCommand};
 use dist::{MockDistServer, MockChannel, MockPackage,
-           MockTargettedPackage, MockComponent, change_channel_date,
+           MockTargetedPackage, MockComponent, change_channel_date,
            ManifestVersion};
 use url::Url;
 use scopeguard;
+use wait_timeout::ChildExt;
 
 /// The configuration used by the tests in this module
 pub struct Config {
-    /// Where we put the multirust / rustc / cargo bins
+    /// Where we put the rustup / rustc / cargo bins
     pub exedir: PathBuf,
     /// The distribution server
     pub distdir: PathBuf,
@@ -53,7 +55,7 @@ pub static CROSS_ARCH2: &'static str = "arm-linux-androideabi";
 // that when we're testing on that host we can't test 'multi-host'.
 pub static MULTI_ARCH1: &'static str = "i686-unknown-linux-gnu";
 
-/// Run this to create the test environment containing multirust, and
+/// Run this to create the test environment containing rustup, and
 /// a mock dist server.
 pub fn setup(s: Scenario, f: &Fn(&Config)) {
     // Unset env variables that will break our testing
@@ -83,20 +85,41 @@ pub fn setup(s: Scenario, f: &Fn(&Config)) {
     create_mock_dist_server(&config.distdir, s);
 
     let current_exe_path = env::current_exe().map(PathBuf::from).unwrap();
-    let exe_dir = current_exe_path.parent().unwrap();
+    let mut exe_dir = current_exe_path.parent().unwrap();
+    if exe_dir.ends_with("deps") {
+        exe_dir = exe_dir.parent().unwrap();
+    }
     let ref build_path = exe_dir.join(format!("rustup-init{}", EXE_SUFFIX));
 
     let ref rustup_path = config.exedir.join(format!("rustup{}", EXE_SUFFIX));
     let setup_path = config.exedir.join(format!("rustup-init{}", EXE_SUFFIX));
-    let multirust_setup_path = config.exedir.join(format!("multirust-setup{}", EXE_SUFFIX));
     let rustc_path = config.exedir.join(format!("rustc{}", EXE_SUFFIX));
     let cargo_path = config.exedir.join(format!("cargo{}", EXE_SUFFIX));
 
-    fs::copy(build_path, rustup_path).unwrap();
+    // Don't copy an executable via `fs::copy` on Unix because that'll require
+    // opening up the destination for writing. If one thread in our process then
+    // forks the child will have the destination open as well (fd inheritance)
+    // which will prevent us from then executing that binary.
+    //
+    // On Windows, however, handles aren't inherited across processes so we can
+    // do fs::copy there, and on Unix we just do symlinks.
+    #[cfg(windows)]
+    fn copy_binary(src: &Path, dst: &Path) -> io::Result<()> {
+        fs::copy(src, dst).map(|_| ())
+    }
+    #[cfg(unix)]
+    fn copy_binary(src: &Path, dst: &Path) -> io::Result<()> {
+        ::std::os::unix::fs::symlink(src, dst)
+    }
+    copy_binary(&build_path, &rustup_path).unwrap();
     fs::hard_link(rustup_path, setup_path).unwrap();
-    fs::hard_link(rustup_path, multirust_setup_path).unwrap();
     fs::hard_link(rustup_path, rustc_path).unwrap();
     fs::hard_link(rustup_path, cargo_path).unwrap();
+
+    // Make sure the host triple matches the build triple. Otherwise testing a 32-bit build of
+    // rustup on a 64-bit machine will fail, because the tests do not have the host detection
+    // functionality built in.
+    run(&config, "rustup", &["set", "host", &this_host_triple()], &[]);
 
     // Create some custom toolchains
     create_custom_toolchains(&config.customdir);
@@ -151,6 +174,17 @@ pub fn expect_stdout_ok(config: &Config, args: &[&str], expected: &str) {
     assert!(out.stdout.contains(expected), args);
 }
 
+pub fn expect_not_stdout_ok(config: &Config, args: &[&str], expected: &str) {
+    let out = run(config, args[0], &args[1..], &[]);
+    println!("out.ok: {}", out.ok);
+    println!("out.stdout:\n\n{}", out.stdout);
+    println!("out.stderr:\n\n{}", out.stderr);
+    println!("expected: {}", expected);
+    let args = format!("{:?}", args);
+    assert!(out.ok, args);
+    assert!(! out.stdout.contains(expected), args);
+}
+
 pub fn expect_stderr_ok(config: &Config, args: &[&str], expected: &str) {
     let out = run(config, args[0], &args[1..], &[]);
     println!("out.ok: {}", out.ok);
@@ -189,6 +223,24 @@ pub fn expect_err_ex(config: &Config, args: &[&str],
     assert!(out.stderr == stderr, format!("err {:?}", args));
 }
 
+pub fn expect_timeout_ok(config: &Config, timeout: Duration, args: &[&str]) {
+    let mut child = cmd(config, args[0], &args[1..])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn().unwrap();
+
+    match child.wait_timeout(timeout).unwrap() {
+        Some(status) => {
+            assert!(status.success(), "not ok {:?}", args);
+        }
+        None => {
+            // child hasn't exited yet
+            child.kill().unwrap();
+            panic!("command timed out: {:?}", args);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SanitizedOutput {
     pub ok: bool,
@@ -206,12 +258,19 @@ pub fn cmd(config: &Config, name: &str, args: &[&str]) -> Command {
 
 pub fn env(config: &Config, cmd: &mut Command) {
     cmd.env("RUSTUP_HOME", config.rustupdir.to_string_lossy().to_string());
-    cmd.env("RUSTUP_DIST_ROOT", format!("file://{}", config.distdir.join("dist").to_string_lossy()));
+    cmd.env("RUSTUP_DIST_SERVER", format!("file://{}", config.distdir.to_string_lossy()));
     cmd.env("CARGO_HOME", config.cargodir.to_string_lossy().to_string());
+    cmd.env("RUSTUP_OVERRIDE_HOST_TRIPLE", this_host_triple());
 
-    // This is only used for some installation tests on unix where CARGO_HOME
-    // above is unset
+    // These are used in some installation tests that unset RUSTUP_HOME/CARGO_HOME
     cmd.env("HOME", config.homedir.to_string_lossy().to_string());
+    cmd.env("USERPROFILE", config.homedir.to_string_lossy().to_string());
+
+    // Setting HOME will confuse the sudo check for rustup-init. Override it
+    cmd.env("RUSTUP_INIT_SKIP_SUDO_CHECK", "yes");
+
+    // Skip the MSVC warning check since it's environment dependent
+    cmd.env("RUSTUP_INIT_SKIP_MSVC_CHECK", "yes");
 }
 
 pub fn run(config: &Config, name: &str, args: &[&str], env: &[(&str, &str)]) -> SanitizedOutput {
@@ -298,6 +357,7 @@ fn build_mock_channel(s: Scenario, channel: &str, date: &str,
     let rust = build_combined_installer(&[&std, &rustc, &cargo, &rust_docs]);
     let cross_std1 = build_mock_cross_std_installer(CROSS_ARCH1, date);
     let cross_std2 = build_mock_cross_std_installer(CROSS_ARCH2, date);
+    let rust_src = build_mock_rust_src_installer();
 
     // Convert the mock installers to mock package definitions for the
     // mock dist server
@@ -307,6 +367,7 @@ fn build_mock_channel(s: Scenario, channel: &str, date: &str,
                    ("rustc", vec![(rustc, host_triple.clone())]),
                    ("cargo", vec![(cargo, host_triple.clone())]),
                    ("rust-docs", vec![(rust_docs, host_triple.clone())]),
+                   ("rust-src", vec![(rust_src, "*".to_string())]),
                    ("rust", vec![(rust, host_triple.clone())])];
 
     if s == Scenario::MultiHost {
@@ -317,6 +378,7 @@ fn build_mock_channel(s: Scenario, channel: &str, date: &str,
         let rust = build_combined_installer(&[&std, &rustc, &cargo, &rust_docs]);
         let cross_std1 = build_mock_cross_std_installer(CROSS_ARCH1, date);
         let cross_std2 = build_mock_cross_std_installer(CROSS_ARCH2, date);
+        let rust_src = build_mock_rust_src_installer();
 
         let triple = MULTI_ARCH1.to_string();
         let more = vec![("rust-std", vec![(std, triple.clone()),
@@ -325,6 +387,7 @@ fn build_mock_channel(s: Scenario, channel: &str, date: &str,
                         ("rustc", vec![(rustc, triple.clone())]),
                         ("cargo", vec![(cargo, triple.clone())]),
                         ("rust-docs", vec![(rust_docs, triple.clone())]),
+                        ("rust-src", vec![(rust_src, "*".to_string())]),
                         ("rust", vec![(rust, triple.clone())])];
 
         all.extend(more);
@@ -332,7 +395,7 @@ fn build_mock_channel(s: Scenario, channel: &str, date: &str,
 
     let packages = all.into_iter().map(|(name, target_pkgs)| {
         let target_pkgs = target_pkgs.into_iter().map(|(installer, triple)| {
-            MockTargettedPackage {
+            MockTargetedPackage {
                 target: triple,
                 available: true,
                 components: vec![],
@@ -378,6 +441,10 @@ fn build_mock_channel(s: Scenario, channel: &str, date: &str,
                 name: "rust-std".to_string(),
                 target: CROSS_ARCH2.to_string(),
             });
+            target_pkg.extensions.push(MockComponent {
+                name: "rust-src".to_string(),
+                target: "*".to_string(),
+            });
         }
     }
 
@@ -389,7 +456,7 @@ fn build_mock_channel(s: Scenario, channel: &str, date: &str,
 }
 
 pub fn this_host_triple() -> String {
-    if let Some(triple) = option_env!("RUSTUP_OVERRIDE_HOST_TRIPLE") {
+    if let Some(triple) = option_env!("RUSTUP_OVERRIDE_BUILD_TRIPLE") {
         triple.to_owned()
     } else {
         let arch = if cfg!(target_arch = "x86") { "i686" }
@@ -475,6 +542,16 @@ fn build_mock_rust_doc_installer() -> MockInstallerBuilder {
     }
 }
 
+fn build_mock_rust_src_installer() -> MockInstallerBuilder {
+    MockInstallerBuilder {
+        components: vec![
+            ("rust-src".to_string(),
+             vec![MockCommand::File("lib/rustlib/src/rust-src/foo.rs".to_string())],
+             vec![("lib/rustlib/src/rust-src/foo.rs".to_string(), "".into())])
+                ]
+    }
+}
+
 fn build_combined_installer(components: &[&MockInstallerBuilder]) -> MockInstallerBuilder {
     MockInstallerBuilder {
         components: components.iter().flat_map(|m| m.components.clone()).collect()
@@ -483,7 +560,7 @@ fn build_combined_installer(components: &[&MockInstallerBuilder]) -> MockInstall
 
 /// This is going to run the compiler to create an executable that
 /// prints some version information. These binaries are stuffed into
-/// the mock installers so we have executables for multirust to run.
+/// the mock installers so we have executables for rustup to run.
 ///
 /// This does a really crazy thing. Because we need to generate a lot
 /// of these, and running rustc is slow, it does it once, stuffs the
@@ -507,23 +584,15 @@ fn mock_bin(_name: &str, version: &str, version_hash: &str) -> Vec<u8> {
 
     fn make_mock_bin_template() -> Vec<u8> {
         // Create a temp directory to hold the source and the output
-        let ref tempdir = TempDir::new("multirust").unwrap();
+        let ref tempdir = TempDir::new("rustup").unwrap();
         let ref source_path = tempdir.path().join("in.rs");
         let ref dest_path = tempdir.path().join(&format!("out{}", EXE_SUFFIX));
 
         // Write the source
-        let ref source = format!(r#"
-            fn main() {{
-                let args: Vec<_> = ::std::env::args().collect();
-                if args.get(1) == Some(&"--version".to_string()) {{
-                    println!("{} ({})");
-                }} else if args.get(1) == Some(&"--empty-arg-test".to_string()) {{
-                    assert!(args.get(2) == Some(&"".to_string()));
-                }} else {{
-                    panic!("bad mock proxy commandline");
-                }}
-            }}
-            "#, EXAMPLE_VERSION, EXAMPLE_VERSION_HASH);
+        let source = include_str!("mock_bin_src.rs")
+            .replace("%EXAMPLE_VERSION%", EXAMPLE_VERSION)
+            .replace("%EXAMPLE_VERSION_HASH%", EXAMPLE_VERSION_HASH);
+
         File::create(source_path).and_then(|mut f| f.write_all(source.as_bytes())).unwrap();
 
         // Create the executable

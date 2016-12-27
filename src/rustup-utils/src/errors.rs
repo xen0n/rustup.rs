@@ -1,13 +1,12 @@
 use std::path::PathBuf;
 use std::ffi::OsString;
-use hyper;
+use url::Url;
+use download;
 
 error_chain! {
-    types {
-        Error, ErrorKind, ChainErr, Result;
+    links {
+        Download(download::Error, download::ErrorKind);
     }
-
-    links { }
 
     foreign_links { }
 
@@ -41,14 +40,18 @@ error_chain! {
             path: PathBuf,
         } {
             description("could not create directory")
-            display("could not crate {} directory: '{}'", name, path.display())
+            display("could not create {} directory: '{}'", name, path.display())
+        }
+        ExpectedType(t: &'static str, n: String) {
+            description("expected type")
+            display("expected type: '{}' for '{}'", t, n)
         }
         FilteringFile {
             name: &'static str,
             src: PathBuf,
             dest: PathBuf,
         } {
-            description("could not copy  file")
+            description("could not copy file")
             display("could not copy {} file from '{}' to '{}'", name, src.display(), dest.display())
         }
         RenamingFile {
@@ -67,19 +70,15 @@ error_chain! {
             description("could not rename directory")
             display("could not rename {} directory from '{}' to '{}'", name, src.display(), dest.display())
         }
-        HttpStatus(e: hyper::status::StatusCode) {
-            description("http request returned an unsuccessful status code")
-            display("http request returned an unsuccessful status code: {}", e)
-        }
         DownloadingFile {
-            url: hyper::Url,
+            url: Url,
             path: PathBuf,
         } {
             description("could not download file")
             display("could not download file from '{}' to '{}", url, path.display())
         }
-        Download404 {
-            url: hyper::Url,
+        DownloadNotExists {
+            url: Url,
             path: PathBuf,
         } {
             description("could not download file")

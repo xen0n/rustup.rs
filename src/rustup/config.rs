@@ -4,21 +4,15 @@ use std::env;
 use std::io;
 use std::process::Command;
 use std::fmt::{self, Display};
-use std::str::FromStr;
-
-use itertools::Itertools;
+use std::sync::Arc;
 
 use errors::*;
 use notifications::*;
 use rustup_dist::{temp, dist};
 use rustup_utils::utils;
-use override_db::OverrideDB;
 use toolchain::{Toolchain, UpdateStatus};
-use telemetry::{TelemetryMode};
 use telemetry_analysis::*;
-
-// Note: multirust-rs jumped from 2 to 12 to leave multirust.sh room to diverge
-pub const METADATA_VERSION: &'static str = "12";
+use settings::{TelemetryMode, SettingsFile, DEFAULT_METADATA_VERSION};
 
 #[derive(Debug)]
 pub enum OverrideReason {
@@ -39,41 +33,33 @@ impl Display for OverrideReason {
     }
 }
 
-#[derive(Debug)]
 pub struct Cfg {
     pub multirust_dir: PathBuf,
-    pub version_file: PathBuf,
-    pub override_db: OverrideDB,
-    pub default_file: PathBuf,
+    pub settings_file: SettingsFile,
     pub toolchains_dir: PathBuf,
     pub update_hash_dir: PathBuf,
     pub temp_cfg: temp::Cfg,
     pub gpg_key: Cow<'static, str>,
     pub env_override: Option<String>,
-    pub dist_root_url: Cow<'static, str>,
-    pub notify_handler: SharedNotifyHandler,
-    pub telemetry_mode: TelemetryMode,
+    pub dist_root_url: String,
+    pub dist_root_server: String,
+    pub notify_handler: Arc<Fn(Notification)>,
 }
 
 impl Cfg {
-    pub fn from_env(notify_handler: SharedNotifyHandler) -> Result<Self> {
+    pub fn from_env(notify_handler: Arc<Fn(Notification)>) -> Result<Self> {
         // Set up the multirust home directory
         let multirust_dir = try!(utils::multirust_home());
 
-        try!(utils::ensure_dir_exists("home", &multirust_dir, ntfy!(&notify_handler)));
+        try!(utils::ensure_dir_exists("home", &multirust_dir,
+                                      &|n| notify_handler(n.into())));
 
-        // Data locations
-        let version_file = multirust_dir.join("version");
-        let override_db = OverrideDB::new(multirust_dir.join("overrides"));
-        let default_file = multirust_dir.join("default");
+        let settings_file = SettingsFile::new(multirust_dir.join("settings.toml"));
+        // Convert from old settings format if necessary
+        try!(settings_file.maybe_upgrade_from_legacy(&multirust_dir));
+
         let toolchains_dir = multirust_dir.join("toolchains");
         let update_hash_dir = multirust_dir.join("update-hashes");
-
-        let notify_clone = notify_handler.clone();
-        let temp_cfg = temp::Cfg::new(multirust_dir.join("tmp"),
-                                      shared_ntfy!(move |n: temp::Notification| {
-                                          notify_clone.call(Notification::Temp(n));
-                                      }));
 
         // GPG key
         let gpg_key = if let Some(path) = env::var_os("RUSTUP_GPG_KEY")
@@ -88,38 +74,50 @@ impl Cfg {
                                .ok()
                                .and_then(utils::if_not_empty);
 
-        let dist_root_url = env::var("RUSTUP_DIST_ROOT")
-                                .ok()
-                                .and_then(utils::if_not_empty)
-                                .map_or(Cow::Borrowed(dist::DEFAULT_DIST_ROOT), Cow::Owned);
+        let dist_root_server = match env::var("RUSTUP_DIST_SERVER") {
+            Ok(ref s) if !s.is_empty() => {
+                s.clone()
+            }
+            _ => {
+                // For backward compatibility
+                env::var("RUSTUP_DIST_ROOT")
+                    .ok()
+                    .and_then(utils::if_not_empty)
+                    .map_or(Cow::Borrowed(dist::DEFAULT_DIST_ROOT), Cow::Owned)
+                    .as_ref()
+                    .trim_right_matches("/dist")
+                    .to_owned()
+            }
+        };
 
-        let telemetry_mode = Cfg::find_telemetry(&multirust_dir);
+        let notify_clone = notify_handler.clone();
+        let temp_cfg = temp::Cfg::new(multirust_dir.join("tmp"),
+                                      dist_root_server.as_str(),
+                                      Box::new(move |n| {
+                                          (notify_clone)(n.into())
+                                      }));
+        let dist_root = dist_root_server.clone() + "/dist";
 
         Ok(Cfg {
             multirust_dir: multirust_dir,
-            version_file: version_file,
-            override_db: override_db,
-            default_file: default_file,
+            settings_file: settings_file,
             toolchains_dir: toolchains_dir,
             update_hash_dir: update_hash_dir,
             temp_cfg: temp_cfg,
             gpg_key: gpg_key,
             notify_handler: notify_handler,
             env_override: env_override,
-            telemetry_mode: telemetry_mode,
-            dist_root_url: dist_root_url,
+            dist_root_url: dist_root,
+            dist_root_server: dist_root_server,
         })
     }
 
     pub fn set_default(&self, toolchain: &str) -> Result<()> {
-        let work_file = try!(self.temp_cfg.new_file());
-
-        try!(utils::write_file("temp", &work_file, toolchain));
-
-        try!(utils::rename_file("default", &*work_file, &self.default_file));
-
-        self.notify_handler.call(Notification::SetDefaultToolchain(toolchain));
-
+        try!(self.settings_file.with_mut(|s| {
+            s.default_toolchain = Some(toolchain.to_owned());
+            Ok(())
+        }));
+        (self.notify_handler)(Notification::SetDefaultToolchain(toolchain));
         Ok(())
     }
 
@@ -127,7 +125,7 @@ impl Cfg {
         if create_parent {
             try!(utils::ensure_dir_exists("toolchains",
                                           &self.toolchains_dir,
-                                          ntfy!(&self.notify_handler)));
+                                          &|n| (self.notify_handler)(n.into())));
         }
 
         Toolchain::from(self, name)
@@ -143,7 +141,7 @@ impl Cfg {
         if create_parent {
             try!(utils::ensure_dir_exists("update-hash",
                                           &self.update_hash_dir,
-                                          ntfy!(&self.notify_handler)));
+                                          &|n| (self.notify_handler)(n.into())));
         }
 
         Ok(self.update_hash_dir.join(toolchain))
@@ -159,38 +157,28 @@ impl Cfg {
     }
 
     pub fn upgrade_data(&self) -> Result<()> {
-        if !utils::is_file(&self.version_file) {
+
+        let current_version = try!(self.settings_file.with(|s| Ok(s.version.clone())));
+
+        if current_version == DEFAULT_METADATA_VERSION {
+            (self.notify_handler)
+                (Notification::MetadataUpgradeNotNeeded(&current_version));
             return Ok(());
         }
 
-        let mut current_version = try!(utils::read_file("version", &self.version_file));
-        let len = current_version.trim_right().len();
-        current_version.truncate(len);
-
-        if current_version == METADATA_VERSION {
-            self.notify_handler
-                .call(Notification::MetadataUpgradeNotNeeded(METADATA_VERSION));
-            return Ok(());
-        }
-
-        self.notify_handler
-            .call(Notification::UpgradingMetadata(&current_version, METADATA_VERSION));
+        (self.notify_handler)
+            (Notification::UpgradingMetadata(&current_version, DEFAULT_METADATA_VERSION));
 
         match &*current_version {
-            "1" => {
-                // This corresponds to an old version of multirust.sh.
-                Err(ErrorKind::UnknownMetadataVersion(current_version).into())
-            }
             "2" => {
                 // The toolchain installation format changed. Just delete them all.
-                self.notify_handler
-                    .call(Notification::UpgradeRemovesToolchains);
+                (self.notify_handler)(Notification::UpgradeRemovesToolchains);
 
                 let dirs = try!(utils::read_dir("toolchains", &self.toolchains_dir));
                 for dir in dirs {
                     let dir = try!(dir.chain_err(|| ErrorKind::UpgradeIoError));
                     try!(utils::remove_dir("toolchain", &dir.path(),
-                                           ::rustup_utils::NotifyHandler::some(&self.notify_handler)));
+                                           &|n| (self.notify_handler)(n.into())));
                 }
 
                 // Also delete the update hashes
@@ -200,9 +188,10 @@ impl Cfg {
                     try!(utils::remove_file("update hash", &file.path()));
                 }
 
-                try!(utils::write_file("version", &self.version_file, METADATA_VERSION));
-
-                Ok(())
+                self.settings_file.with_mut(|s| {
+                    s.version = DEFAULT_METADATA_VERSION.to_owned();
+                    Ok(())
+                })
             }
             _ => Err(ErrorKind::UnknownMetadataVersion(current_version).into()),
         }
@@ -210,26 +199,24 @@ impl Cfg {
 
     pub fn delete_data(&self) -> Result<()> {
         if utils::path_exists(&self.multirust_dir) {
-            Ok(try!(utils::remove_dir("home", &self.multirust_dir, ntfy!(&self.notify_handler))))
+            Ok(try!(utils::remove_dir("home", &self.multirust_dir,
+                                      &|n| (self.notify_handler)(n.into()))))
         } else {
             Ok(())
         }
     }
 
     pub fn find_default(&self) -> Result<Option<Toolchain>> {
-        if !utils::is_file(&self.default_file) {
-            return Ok(None);
-        }
-        let content = try!(utils::read_file("default", &self.default_file));
-        let name = content.trim_matches('\n');
-        if name.is_empty() {
-            return Ok(None);
-        }
+        let opt_name = try!(self.settings_file.with(|s| Ok(s.default_toolchain.clone())));
 
-        let toolchain = try!(self.verify_toolchain(name)
-                             .chain_err(|| ErrorKind::ToolchainNotInstalled(name.to_string())));
+        if let Some(name) = opt_name {
+            let toolchain = try!(self.verify_toolchain(&name)
+                                 .chain_err(|| ErrorKind::ToolchainNotInstalled(name.to_string())));
 
-        Ok(Some(toolchain))
+            Ok(Some(toolchain))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn find_override(&self, path: &Path) -> Result<Option<(Toolchain, OverrideReason)>> {
@@ -239,8 +226,10 @@ impl Cfg {
             return Ok(Some((toolchain, OverrideReason::Environment)));
         }
 
-        if let Some((name, reason_path)) = try!(self.override_db
-                                                    .find(path, self.notify_handler.as_ref())) {
+        let result = try!(self.settings_file.with(|s| {
+            Ok(s.find_override(path, self.notify_handler.as_ref()))
+        }));
+        if let Some((name, reason_path)) = result {
             let toolchain = try!(self.verify_toolchain(&name).chain_err(|| ErrorKind::ToolchainNotInstalled(name.to_string())));
             return Ok(Some((toolchain, OverrideReason::OverrideDB(reason_path))));
         }
@@ -261,10 +250,13 @@ impl Cfg {
 
     pub fn list_toolchains(&self) -> Result<Vec<String>> {
         if utils::is_directory(&self.toolchains_dir) {
-            let toolchains: Vec<_> = try!(utils::read_dir("toolchains", &self.toolchains_dir))
+            let mut toolchains: Vec<_> = try!(utils::read_dir("toolchains", &self.toolchains_dir))
                                          .filter_map(io::Result::ok)
+                                         .filter(|e| e.file_type().map(|f| !f.is_file()).unwrap_or(false))
                                          .filter_map(|e| e.file_name().into_string().ok())
                                          .collect();
+
+            utils::toolchain_sort(&mut toolchains);
 
             Ok(toolchains)
         } else {
@@ -275,70 +267,42 @@ impl Cfg {
     pub fn update_all_channels(&self) -> Result<Vec<(String, Result<UpdateStatus>)>> {
         let toolchains = try!(self.list_toolchains());
 
-        let mut toolchains: Vec<(dist::ToolchainDesc, String)> = toolchains.into_iter()
-            .filter_map(|name| {
-                let desc = dist::ToolchainDesc::from_str(&name);
-                let tracked = desc.into_iter().filter(|d| d.is_tracking()).next();
-                tracked.map(|d| (d, name))
-            }).collect();
+        // Convert the toolchain strings to Toolchain values
+        let toolchains = toolchains.into_iter();
+        let toolchains = toolchains.map(|n| (n.clone(), self.get_toolchain(&n, true)));
 
-        fn channel_sort_key(s: &str) -> String {
-            if s == "stable" {
-                String::from("0")
-            } else if s == "beta" {
-                String::from("1")
-            } else if s == "nightly" {
-                String::from("2")
-            } else {
-                format!("3{}", s)
-            }
-        }
-
-        toolchains.sort_by(|&(ref a, _), &(ref b, _)| {
-            let a = format!("{}-{}-{}",
-                            channel_sort_key(&a.channel),
-                            a.date.as_ref().map(String::as_str).unwrap_or(""),
-                            a.target);
-            let b = format!("{}-{}-{}",
-                            channel_sort_key(&b.channel),
-                            b.date.as_ref().map(String::as_str).unwrap_or(""),
-                            b.target);
-            a.cmp(&b)
+        // Filter out toolchains that don't track a release channel
+        let toolchains = toolchains.filter(|&(_, ref t)| {
+            t.as_ref().map(|t| t.is_tracking()).unwrap_or(false)
         });
 
-        let updates = toolchains.into_iter()
-            .map(|(_, name)| {
-                let result = self.get_toolchain(&name, true)
-                    .and_then(|t| t.install_from_dist());
-                if let Err(ref e) = result {
-                    self.notify_handler.call(Notification::NonFatalError(e));
+        // Update toolchains and collect the results
+        let toolchains = toolchains.map(|(n, t)| {
+            let t = t.and_then(|t| {
+                let t = t.install_from_dist();
+                if let Err(ref e) = t {
+                    (self.notify_handler)(Notification::NonFatalError(e));
                 }
-                (name, result)
-            }).collect();
+                t
+            });
 
-        Ok(updates)
+            (n, t)
+        });
+
+        Ok(toolchains.collect())
     }
 
     pub fn check_metadata_version(&self) -> Result<()> {
         try!(utils::assert_is_directory(&self.multirust_dir));
 
-        if !utils::is_file(&self.version_file) {
-            self.notify_handler.call(Notification::WritingMetadataVersion(METADATA_VERSION));
-
-            try!(utils::write_file("metadata version", &self.version_file, METADATA_VERSION));
-
-            Ok(())
-        } else {
-            let current_version = try!(utils::read_file("metadata version", &self.version_file));
-
-            self.notify_handler.call(Notification::ReadMetadataVersion(&current_version));
-
-            if &*current_version == METADATA_VERSION {
+        self.settings_file.with(|s| {
+            (self.notify_handler)(Notification::ReadMetadataVersion(&s.version));
+            if s.version == DEFAULT_METADATA_VERSION {
                 Ok(())
             } else {
                 Err(ErrorKind::NeedMetadataUpgrade.into())
             }
-        }
+        })
     }
 
     pub fn toolchain_for_dir(&self, path: &Path) -> Result<(Toolchain, Option<OverrideReason>)> {
@@ -405,9 +369,22 @@ impl Cfg {
         toolchain.open_docs(relative)
     }
 
+    pub fn set_default_host_triple(&self, host_triple: &str) -> Result<()> {
+        self.settings_file.with_mut(|s| {
+            s.default_host_triple = Some(host_triple.to_owned());
+            Ok(())
+        })
+    }
+
+    pub fn get_default_host_triple(&self) -> Result<dist::TargetTriple> {
+        Ok(try!(self.settings_file.with(|s| {
+            Ok(s.default_host_triple.as_ref().map(|s| dist::TargetTriple::from_str(&s)))
+        })).unwrap_or_else(dist::TargetTriple::from_build))
+    }
+
     pub fn resolve_toolchain(&self, name: &str) -> Result<String> {
         if let Ok(desc) = dist::PartialToolchainDesc::from_str(name) {
-            let host = dist::TargetTriple::from_host();
+            let host = try!(self.get_default_host_triple());
             Ok(desc.resolve(&host).to_string())
         } else {
             Ok(name.to_owned())
@@ -415,50 +392,39 @@ impl Cfg {
     }
 
     pub fn set_telemetry(&self, telemetry_enabled: bool) -> Result<()> {
-        match telemetry_enabled {
-            true => self.enable_telemetry(),
-            false => self.disable_telemetry(),
-        }
+        if telemetry_enabled { self.enable_telemetry() } else { self.disable_telemetry() }
     }
 
     fn enable_telemetry(&self) -> Result<()> {
-        let work_file = try!(self.temp_cfg.new_file());
-        
-        let _ = utils::ensure_dir_exists("telemetry", &self.multirust_dir.join("telemetry"), ntfy!(&NotifyHandler::none()));
+        try!(self.settings_file.with_mut(|s| {
+            s.telemetry = TelemetryMode::On;
+            Ok(())
+        }));
 
-        try!(utils::write_file("temp", &work_file, ""));
+        let _ = utils::ensure_dir_exists("telemetry", &self.multirust_dir.join("telemetry"),
+                                         &|_| ());
 
-        try!(utils::rename_file("telemetry", &*work_file, &self.multirust_dir.join("telemetry-on")));
-
-        self.notify_handler.call(Notification::SetTelemetry("on"));
+        (self.notify_handler)(Notification::SetTelemetry("on"));
 
         Ok(())
     }
 
     fn disable_telemetry(&self) -> Result<()> {
-        let _ = utils::remove_file("telemetry-on", &self.multirust_dir.join("telemetry-on"));
+        try!(self.settings_file.with_mut(|s| {
+            s.telemetry = TelemetryMode::Off;
+            Ok(())
+        }));
 
-        self.notify_handler.call(Notification::SetTelemetry("off"));
+        (self.notify_handler)(Notification::SetTelemetry("off"));
 
         Ok(())
     }
 
-    pub fn telemetry_enabled(&self) -> bool {
-        match self.telemetry_mode {
+    pub fn telemetry_enabled(&self) -> Result<bool> {
+        Ok(match try!(self.settings_file.with(|s| Ok(s.telemetry))) {
             TelemetryMode::On => true,
             TelemetryMode::Off => false,
-        }
-    }
-
-    fn find_telemetry(multirust_dir: &PathBuf) -> TelemetryMode {
-        // default telemetry should be off - if no telemetry file is found, it's off
-        let telemetry_file = multirust_dir.join("telemetry-on");
-
-        if utils::is_file(telemetry_file) {
-            return TelemetryMode::On;
-        }
-
-        TelemetryMode::Off
+        })
     }
 
     pub fn analyze_telemetry(&self) -> Result<TelemetryAnalysis> {

@@ -9,11 +9,9 @@
 release channels, enabling you to easily switch between stable, beta,
 and nightly compilers and keep them updated. It makes cross-compiling
 simpler with binary builds of the standard library for common platforms.
-And it runs on all platforms Rust supports, especially Windows.
+And it runs on all platforms Rust supports, including Windows.
 
 [The Rust Programming Language]: https://www.rust-lang.org
-
-**WARNING: This is beta software.**
 
 * [Installation](#installation)
 * [How rustup works](#how-rustup-works)
@@ -23,7 +21,8 @@ And it runs on all platforms Rust supports, especially Windows.
 * [Toolchain specification](#toolchain-specification)
 * [Cross-compilation](#cross-compilation)
 * [Working with Rust on Windows](#working-with-rust-on-windows)
-* [Working with custom toolchains](#working-with-custom-toolchains)
+* [Working with custom toolchains](#working-with-custom-toolchains-and-local-builds)
+* [Working with HTTP proxies](#working-with-http-proxies)
 * [Examples](#examples)
 * [Environment variables](#environment-variables)
 * [Other installation methods](#other-installation-methods)
@@ -57,6 +56,33 @@ you are ready to Rust. If you decide Rust isn't your thing, you can
 completely remove it from your system by running `rustup self
 uninstall`.
 
+#### Enable tab completion for Bash, Fish, or Zsh
+
+`rustup` now supports generating completion scripts for Bash, Fish,
+and Zsh. See `rustup help completions` for full details, but the
+gist is as simple as using one of the following:
+
+```
+# Bash
+$ rustup completions bash > /etc/bash_completion.d/rustup.bash-completion
+
+# Fish
+$ rustup completions fish > ~/.config/fish/completions/rustup.fish
+
+# Zsh
+$ rustup completions zsh > ~/.zfunc/_rustup
+```
+
+*Note:* you may need to restart your shell in order for the changes to take
+ effect.
+
+For `zsh`, you must then add the following line in your `~/.zshrc` before
+`compinit`:
+
+```zsh
+fpath+=~/.zfunc
+```
+
 ## How rustup works
 
 `rustup` is a *toolchain multiplexer*. It installs and manages many
@@ -72,10 +98,11 @@ compiler. If you later *change the default toolchain* to nightly with
 `rustup default nightly`, then that same proxy will run the `nightly`
 compiler instead.
 
-This is similar to Ruby's [rbenv] or Python's [pyenv].
+This is similar to Ruby's [rbenv], Python's [pyenv], or Node's [nvm].
 
 [rbenv]: https://github.com/rbenv/rbenv
 [pyenv]: https://github.com/yyuu/pyenv
+[nvm]: https://github.com/creationix/nvm
 
 ## Keeping Rust up to date
 
@@ -107,17 +134,31 @@ info: downloading self-updates
 
 ```
 
-This is the essense of `rustup`.
+This is the essence of `rustup`.
+
+### Keeping rustup up to date
+
+Running `rustup update` also checks for updates to `rustup` and automatically
+installs the latest version. To manually check for updates and install the
+latest version of `rustup` without updating installed toolchains type `rustup
+self update`:
+
+```
+$ rustup self update
+info: checking for self-updates
+info: downloading self-updates
+```
 
 ## Working with nightly Rust
 
 Rustup gives you easy access to the nightly compiler and its
-[experimental features]. To add it just run `rustup update nightly`:
+[experimental features]. To add it just run `rustup install
+nightly`:
 
 [experimental features]: http://doc.rust-lang.org/nightly/book/nightly-rust.html
 
 ```
-$ rustup update nightly
+$ rustup install nightly
 info: syncing channel updates for 'nightly'
 info: downloading toolchain manifest
 info: downloading component 'rustc'
@@ -182,17 +223,17 @@ will be invoked.
 To pin to a specific nightly:
 
 ```
-rustup override add nightly-2014-12-18
+rustup override set nightly-2014-12-18
 ```
 
 Or a specific stable release:
 
 ```
-rustup override add 1.0.0
+rustup override set 1.0.0
 ```
 
 To see the active toolchain use `rustup show`. To remove the override
-and use the default toolchain again, `rustup override remove`.
+and use the default toolchain again, `rustup override unset`.
 
 ## Toolchain specification
 
@@ -223,21 +264,21 @@ useful for installing a 32-bit compiler on a 64-bit platform, or for
 installing the [MSVC-based toolchain] on Windows. For example:
 
 ```
-$ rustup default stable-x86_64-pc-windows-msvc
+$ rustup install stable-x86_64-pc-windows-msvc
 ```
 
 For convenience, elements of the target triple that are omitted will be
 inferred, so the above could be written:
 
 ```
-$ rustup default stable-msvc
+$ rustup install stable-msvc
 ```
 
 Toolchain names that don't name a channel instead can be used to name
 [custom toolchains].
 
 [MSVC-based toolchain]: https://www.rust-lang.org/downloads.html#win-foot
-[custom toolchains]: #working-with-custom-toolchains
+[custom toolchains]: #working-with-custom-toolchains-and-local-builds
 
 ## Cross-compilation
 
@@ -261,7 +302,7 @@ info: downloading component 'rust-std' for 'arm-linux-androideabi'
 info: installing component 'rust-std' for 'arm-linux-androideabi'
 ```
 
-With the `arm-linux-andoideabi` target installed you can then build
+With the `arm-linux-androideabi` target installed you can then build
 for Android with Cargo by passing the `--target` flag, as in `cargo
 build --target=arm-linux-androideabi`.
 
@@ -269,7 +310,7 @@ Note that `rustup target add` only installs the Rust standard library
 for a given target. There are typically other tools necessary to
 cross-compile, particularly a linker. For example, to cross compile
 to Android the [Android NDK] must be installed. In the future, `rustup`
-will provide assistence installing the NDK components as well.
+will provide assistance installing the NDK components as well.
 
 [Android NDK]: https://developer.android.com/tools/sdk/ndk/index.html
 
@@ -288,18 +329,43 @@ interop with software produced by Visual Studio use the MSVC build of
 Rust; for interop with GNU software built using the [MinGW/MSYS2
 toolchain] use the GNU build.
 
-MSVC builds of Rust additionally require an [installation of Visual
-Studio 2013 (or later) or the Visual C++ Build Tools 2015][vs] so
-rustc can use its linker. For Visual Studio, make sure to check
-the "C++ tools" option. No additional software installation is
+When target the MSVC ABI, Rust additionally require an [installation
+of Visual Studio 2013 (or later) or the Visual C++ Build Tools
+2015][vs] so rustc can use its linker. For Visual Studio, make sure to
+check the "C++ tools" option. No additional software installation is
 necessary for basic use of the GNU build.
 
-Rust's support for the GNU ABI is more mature, and is recommended for
-typical uses, so that's what `rustup` installs by default. The MSVC
-toolchain is always available. To switch to it just
+By default rustup on Windows configures Rust to target the 32-bit MSVC
+ABI, that is the `i686-pc-windows-msvc` target triple. More
+specifically, the toolchains that rustup chooses to install, unless
+told otherwise through the [toolchain specification], will be compiled
+to run on a `i686-pc-windows-msvc` host, and will target that platform
+by default. When you write `rustup update nightly`, rustup interprets
+it as `rustup update nightly-i686-pc-windows-msvc`. You can change this
+behavior with `rustup set default-host` or during installation.
 
 ```
-$ rustup default stable-msvc
+$ rustup set default-host x86_64-pc-windows-msvc
+```
+
+[toolchain specification]: #toolchain-specification
+
+Since the MSVC ABI provides the best interoperation with other Windows software
+it is recommended for most purposes. The GNU toolchain is always available, even
+if you don't use it by default. Just install it with `rustup install`:
+
+```
+$ rustup install stable-gnu
+```
+
+You don't need to switch toolchains to support all windows targets though;
+a single toolchain supports all four x86 windows targets:
+
+```
+$ rustup target add x86_64-pc-windows-msvc
+$ rustup target add x86_64-pc-windows-gnu
+$ rustup target add i686-pc-windows-msvc
+$ rustup target add i686-pc-windows-gnu
 ```
 
 [d]: https://www.rust-lang.org/downloads.html#win-foot
@@ -309,14 +375,21 @@ $ rustup default stable-msvc
 [MinGW/MSYS2 toolchain]: https://msys2.github.io/
 [vs]: https://www.visualstudio.com/downloads
 
-## Working with custom toolchains
+## Working with custom toolchains and local builds
 
 For convenience of developers working on Rust itself, `rustup` can manage
-local builds of the Rust toolchain. To teach `rustup` about your build
-just run:
+local builds of the Rust toolchain. To teach `rustup` about your build,
+run:
 
 ```
 $ rustup toolchain link my-toolchain path/to/my/toolchain/sysroot
+```
+
+For example, on Ubuntu you might clone `rust-lang/rust` into `~/rust`, build it, and then run:
+
+```
+$ rustup toolchain link myrust ~/rustg/x86_64-unknown-linux-gnu/stage2/
+$ rustup default myrust
 ```
 
 Now you can name `my-toolchain` as any other `rustup`
@@ -327,7 +400,32 @@ my-toolchain rustc`.
 Because the `rust-lang/rust` tree does not include Cargo, *when `cargo`
 is invoked for a custom toolchain and it is not available, `rustup`
 will attempt to use `cargo` from one of the release channels*,
-prefering 'nightly', then 'beta' or 'stable'.
+preferring 'nightly', then 'beta' or 'stable'.
+
+## Working with HTTP proxies
+
+Enterprise networks often don't have direct outside HTTP access, but enforce
+the use of HTTP proxies. If you're on such a network, you can request that
+rustup uses a proxy by setting its URL in the environment. In most cases,
+setting `http_proxy` should be sufficient. On a Unix-like system with a
+shell like __bash__ or __zsh__, you could use:
+
+```
+export http_proxy=http://proxy.example.com:8080
+```
+
+On Windows, the command would be:
+
+```
+set http_proxy=http://proxy.example.com:8080
+```
+
+If you need a more complex setup, rustup supports the convention used by
+the __curl__ program, documented in the ENVIRONMENT section of
+[its manual page][curlman].
+
+[curlman]: https://curl.haxx.se/docs/manpage.html
+
 
 ## Examples
 
@@ -339,6 +437,7 @@ Command | Description
 `rustup target add arm-linux-androideabi` | Install the Android target
 `rustup target remove arm-linux-androideabi` | Remove the Android target
 `rustup run nightly rustc foo.rs` | Run the nightly regardless of the active toolchain
+`rustc +nightly foo.rs` | Shorthand way to run a nightly compiler
 `rustup run nightly bash` | Run a shell configured for the nightly compiler
 `rustup default stable-msvc` | On Windows, use the MSVC toolchain instead of GNU
 `rustup override nightly-2015-04-01` | For the current directory, use a nightly from a specific date
@@ -347,21 +446,25 @@ Command | Description
 
 ## Environment variables
 
-- `RUSTUP_HOME` (default: `~/.rustup` or `%USERPROFILE%/.rustup`)
+- `RUSTUP_HOME` (default: `~/.multirust` or `%USERPROFILE%/.multirust`)
   Sets the root rustup folder, used for storing installed
-  toolchains and configuration options.
+  toolchains and configuration options. (rustup used to be called multirust. Use
+  of `.multirust` is a holdover from that. See #537.)
 
 - `RUSTUP_TOOLCHAIN` (default: none)
   If set, will override the toolchain used for all rust tool
-  nvocations. A toolchain with this name should be installed, or
+  invocations. A toolchain with this name should be installed, or
   invocations will fail.
 
-- `RUSTUP_DIST_ROOT` (default: `https://static.rust-lang.org/dist`)
-  Sets the root URL for downloading Rust toolchains and release
-  channel updates. You can change this to instead use a local mirror,
+- `RUSTUP_DIST_SERVER` (default: `https://static.rust-lang.org`)
+  Sets the root URL for downloading static resources related to Rust.
+  You can change this to instead use a local mirror,
   or to test the binaries from the staging directory.
 
-- `RUSTUP_UPDATE_ROOT` (default `https://static.rust-lang.org/rustup/dist`)
+- `RUSTUP_DIST_ROOT` (default: `https://static.rust-lang.org/dist`)
+  Deprecated. Use `RUSTUP_DIST_SERVER` instead.
+
+- `RUSTUP_UPDATE_ROOT` (default `https://static.rust-lang.org/rustup`)
   Sets the root URL for downloading self-updates.
 
 ## Other installation methods
@@ -369,16 +472,30 @@ Command | Description
 The primary installation method, as described at
 [www.rustup.rs](https://www.rustup.rs), differs by platform:
 
-* On Windows, download and run the [rustup-init.exe for the
-  `i686-pc-windows-gnu` target][setup]. Although this build of
-  `rustup` installs compilers targeting the GNU ABI by default,
-  compilers targetting the MSVC ABI can be installed with e.g. `rustup
-  update stable-msvc`.
+* On Windows, download and run the [rustup-init.exe built for
+  `i686-pc-windows-gnu` target][setup]. Despite being built against the GNU
+  toolchain, _the Windows build of rustup will install Rust for the MSVC
+  toolchain if it detects that MSVC is installed_. If you prefer to install GNU
+  toolchains or x86_64 toolchains by default this can be modified at install
+  time, either interactively or with the `--default-host` flag, or after
+  installation via `rustup set default-host`. In general, this is the build
+  of rustup one should install on Windows.
 * On Unix, run `curl https://sh.rustup.rs -sSf | sh` in your
-  shell. This downloads and runs the correct version of
-  `rustup-init` for your platform.
+  shell. This downloads and runs [`rustup-init.sh`], which in turn
+  downloads and runs the correct version of the `rustup-init`
+  executable for your platform.
 
 [setup]: https://static.rust-lang.org/rustup/dist/i686-pc-windows-gnu/rustup-init.exe
+[`rustup-init.sh`]: https://static.rust-lang.org/rustup/rustup-init.sh
+
+`rustup-init` accepts arguments, which can be passed through
+the shell script. Some examples:
+
+```
+$ curl https://sh.rustup.rs -sSf | sh -s -- --help
+$ curl https://sh.rustup.rs -sSf | sh -s -- --no-modify-path
+$ curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain nightly
+```
 
 If you prefer you can directly download `rustup-init` for the
 platform of your choice:
@@ -405,19 +522,21 @@ Visual Studio, make sure to check the "C++ tools" option. No
 additional software installation is necessary for basic use of
 the GNU build.
 
+[vs]: https://www.visualstudio.com/downloads
+
 To install from source just run `cargo run --release`. Note that
 currently rustup only builds on nightly Rust, and that after
-installation the rustup toolchains will supercede any pre-existing
+installation the rustup toolchains will supersede any pre-existing
 toolchains by prepending `~/.cargo/bin` to the `PATH` environment
 variable.
 
-[vs]: https://www.visualstudio.com/downloads
-
 ## Security
 
-`rustup` is secure enough for the non-paranoid, but it still needs
-work. `rustup` performs all downloads over HTTPS, but does not
+`rustup` is secure enough for the non-paranoid, but it [still needs
+work][s]. `rustup` performs all downloads over HTTPS, but does not
 yet validate signatures of downloads.
+
+[s]: https://github.com/rust-lang-nursery/rustup.rs/issues?q=is%3Aopen+is%3Aissue+label%3Asecurity
 
 ## FAQ
 
@@ -432,6 +551,17 @@ updated to reflect that.
 rustup is the successor to [multirust]. rustup began as multirust-rs,
 a rewrite of multirust from shell script to Rust, by [Diggory Blake],
 and is now maintained by The Rust Project.
+
+### Can rustup download the Rust source code?
+
+The Rust source can be obtained by running `rustup component add rust-src`. 
+It will be downloaded to the `<toolchain root>/lib/rustlib/src/rust` 
+directory of the current toolchain.
+
+### rustup fails with Windows error 32
+
+If rustup fails with Windows error 32, it may be due to antivirus
+scanning in the background. Disable antivirus scanner and try again.
 
 [multirust]: https://github.com/brson/multirust
 [Diggory Blake]: https://github.com/Diggsey
